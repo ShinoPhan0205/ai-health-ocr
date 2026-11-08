@@ -116,11 +116,18 @@ export default function OCRPage() {
     setReconciledData([]);
     
     try {
-      const BATCH_SIZE = 15; // Mỗi lần gửi 15 trang lên Vercel
+      const BATCH_SIZE = 15; 
       let allM1Patients: any[] = [];
       let allM2Patients: any[] = [];
       
       const totalBatches = Math.ceil(allPdfPages.length / BATCH_SIZE);
+
+      // KHẮC PHỤC LỖI 2: Hàm ép kiểu số trang (Chặn lỗi AI trả về string)
+      const parsePage = (val: any, fallback: number) => {
+        if (val === undefined || val === null || val === "") return fallback;
+        const num = Number(val);
+        return isNaN(num) ? fallback : num;
+      };
 
       // 1. CHẠY VÒNG LẶP CHIA NHỎ VÀ GỬI LÊN API
       for (let i = 0; i < allPdfPages.length; i += BATCH_SIZE) {
@@ -129,7 +136,6 @@ export default function OCRPage() {
 
         const batchPages = allPdfPages.slice(i, i + BATCH_SIZE);
         
-        // Gọi API song song cho đợt hiện tại
         const [res1, res2] = await Promise.all([
           fetchWithRetry("MODEL_1", batchPages, 3),
           fetchWithRetry("MODEL_2", batchPages, 3)
@@ -138,43 +144,70 @@ export default function OCRPage() {
         const m1P = res1.patients || [];
         const m2P = res2.patients || [];
 
-        // 2. CHUẨN HÓA INDEX (OFFSET): 
-        // Biến số trang của đợt nhỏ (0-14) thành số trang của toàn file (ví dụ đợt hai sẽ là 15-29)
+        // Áp dụng hàm parsePage để bù trừ (Offset) an toàn
         const adjustedM1 = m1P.map((p: any) => ({
           ...p,
-          page_start: typeof p.page_start === "number" ? p.page_start + i : i,
-          page_end: typeof p.page_end === "number" ? p.page_end + i : i + batchPages.length - 1
+          page_start: parsePage(p.page_start, 0) + i,
+          page_end: parsePage(p.page_end, batchPages.length - 1) + i
         }));
         
         const adjustedM2 = m2P.map((p: any) => ({
           ...p,
-          page_start: typeof p.page_start === "number" ? p.page_start + i : i,
-          page_end: typeof p.page_end === "number" ? p.page_end + i : i + batchPages.length - 1
+          page_start: parsePage(p.page_start, 0) + i,
+          page_end: parsePage(p.page_end, batchPages.length - 1) + i
         }));
 
-        // Gộp kết quả của đợt này vào mảng tổng
         allM1Patients = [...allM1Patients, ...adjustedM1];
         allM2Patients = [...allM2Patients, ...adjustedM2];
       }
 
-      setStatus(`🔄 Đang tổng hợp dữ liệu và tìm điểm bất đồng...`);
-      
-      // 3. ĐỐI CHIẾU VÀ TẠO RA DỮ LIỆU CUỐI CÙNG (RECONCILIATION)
-      let allReconciledData: PatientData[] = [];
-      const maxLen = Math.max(allM1Patients.length, allM2Patients.length);
+      setStatus(`🔄 Đang tổng hợp dữ liệu và xóa trùng lặp...`);
 
-      for (let j = 0; j < maxLen; j++) {
-        const p1 = allM1Patients[j] || {};
-        const p2 = allM2Patients[j] || {};
+      // KHẮC PHỤC LỖI 1: Gom nhóm bệnh nhân trùng tên (Xóa duplicate do cắt batch)
+      const mergePatients = (patients: any[]) => {
+        const map = new Map<string, any>();
+        patients.forEach(p => {
+          const name = String(p.HO_TEN || p.ho_ten || p.Ho_Ten || "KHÔNG_TÊN").trim().toUpperCase();
+          if (!name) return;
+          
+          if (map.has(name)) {
+            const existing = map.get(name);
+            // Nối khoảng trang lại với nhau cho liền mạch
+            existing.page_start = Math.min(existing.page_start, p.page_start);
+            existing.page_end = Math.max(existing.page_end, p.page_end);
+            map.set(name, existing);
+          } else {
+            map.set(name, { ...p });
+          }
+        });
+        return Array.from(map.values());
+      };
+
+      const uniqueM1 = mergePatients(allM1Patients);
+      const uniqueM2 = mergePatients(allM2Patients);
+
+      // TẠO DANH SÁCH TÊN DUY NHẤT TỪ CẢ 2 MODEL
+      const allNames = Array.from(new Set([
+        ...uniqueM1.map(p => String(p.HO_TEN || p.ho_ten || "KHÔNG_TÊN").trim().toUpperCase()),
+        ...uniqueM2.map(p => String(p.HO_TEN || p.ho_ten || "KHÔNG_TÊN").trim().toUpperCase())
+      ]));
+
+      let allReconciledData: PatientData[] = [];
+
+      // 2. ĐỐI CHIẾU DỰA TRÊN TÊN BỆNH NHÂN (Thay vì chỉ mục index)
+      allNames.forEach((name, index) => {
+        const p1 = uniqueM1.find(p => String(p.HO_TEN || p.ho_ten || "KHÔNG_TÊN").trim().toUpperCase() === name) || {};
+        const p2 = uniqueM2.find(p => String(p.HO_TEN || p.ho_ten || "KHÔNG_TÊN").trim().toUpperCase() === name) || {};
         
-        const startPage = typeof p1.page_start === "number" ? p1.page_start : (typeof p2.page_start === "number" ? p2.page_start : 0);
-        const endPage = typeof p1.page_end === "number" ? p1.page_end : (typeof p2.page_end === "number" ? p2.page_end : allPdfPages.length - 1);
+        const startPage = Math.min(parsePage(p1.page_start, 9999), parsePage(p2.page_start, 9999));
+        const endPage = Math.max(parsePage(p1.page_end, 0), parsePage(p2.page_end, 0));
         
-        // Cắt ảnh dựa trên index toàn cục đã được cộng dồn (Offset)
-        const patientImages = allPdfPages.slice(Math.max(0, startPage), Math.min(allPdfPages.length, endPage + 1));
+        const safeStart = startPage === 9999 ? 0 : startPage;
+        // Cắt mảng ảnh chính xác cho từng người
+        const patientImages = allPdfPages.slice(Math.max(0, safeStart), Math.min(allPdfPages.length, endPage + 1));
 
         const patientReconciled: any = { 
-          _id: j, 
+          _id: index, 
           patientImages: patientImages 
         }; 
 
@@ -195,7 +228,7 @@ export default function OCRPage() {
         });
         
         allReconciledData.push(patientReconciled as PatientData);
-      }
+      });
 
       setReconciledData(allReconciledData); 
       setPatientIndex(0);
