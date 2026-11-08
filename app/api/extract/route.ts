@@ -2,12 +2,13 @@ import { NextResponse } from "next/server";
 
 export async function POST(req: Request) {
   try {
-    const { pages, modelId } = await req.json();
+    // 1. NHẬN THÊM docType TỪ FRONTEND
+    const { pages, modelId, docType = "ADULT_18" } = await req.json();
     
-    // Lựa chọn API Key và Model tương ứng để chia tải và đổi model
+    // Lựa chọn API Key và Model tương ứng
     const isModel2 = modelId === "MODEL_2";
     const apiKey = isModel2 ? process.env.GEMINI_API_KEY_2 : process.env.GEMINI_API_KEY_1;
-    const modelName = isModel2 ? "gemini-3.5-flash-lite" : "gemini-3.1-flash-lite";
+    const modelName = isModel2 ? "gemini-3.5-flash-lite" : "gemini-3.1-flash-lite"; // Chỉnh lại theo tên model thực tế của bạn
 
     if (!apiKey) {
       return NextResponse.json({ 
@@ -19,8 +20,54 @@ export async function POST(req: Request) {
       inlineData: { mimeType: "image/jpeg", data: page.base64.split(",")[1] }
     }));
 
-    // CẬP NHẬT PROMPT ĐỂ XUẤT RA KEY KHỚP VỚI "form chuan.xlsx" VÀ THÊM SO_TRANG_PDF
-    const prompt = `Bạn là một chuyên gia đọc hồ sơ khám sức khỏe. Hãy đọc các trang scan và nhóm lại theo từng bệnh nhân (dựa vào Tên, Năm sinh, Mã ID).
+    // 2. CẤU HÌNH PROMPT VÀ JSON SCHEMA THEO TỪNG LOẠI HỒ SƠ
+    let prompt = "";
+    let responseSchema: any = null;
+
+    if (docType === "STUDENT") {
+      prompt = `Bạn là chuyên gia bóc tách dữ liệu y tế. Hãy trích xuất thông tin từ Phiếu Kiểm Tra Sức Khỏe Học Sinh Phổ Thông. Đọc các trang scan và nhóm lại theo từng học sinh. Nếu thông tin nào không có, hãy để chuỗi rỗng "". TUYỆT ĐỐI phải có page_start và page_end.`;
+      
+      // JSON Schema cho Học sinh (Gemini REST API yêu cầu type in hoa)
+      responseSchema = {
+        type: "ARRAY",
+        description: "Danh sách hồ sơ học sinh",
+        items: {
+          type: "OBJECT",
+          properties: {
+            page_start: { type: "INTEGER", description: "Trang bắt đầu của học sinh này (từ 0)" },
+            page_end: { type: "INTEGER", description: "Trang kết thúc" },
+            fullName: { type: "STRING", description: "Họ và tên" },
+            dateOfBirth: { type: "STRING", description: "Ngày tháng năm sinh" },
+            age: { type: "INTEGER", description: "Tuổi" },
+            idNumber: { type: "STRING", description: "Số định danh / CCCD" },
+            idIssueDate: { type: "STRING", description: "Ngày cấp" },
+            idIssuePlace: { type: "STRING", description: "Nơi cấp" },
+            phone: { type: "STRING", description: "Điện thoại" },
+            addressDetail: { type: "STRING", description: "Số nhà/thôn/xóm/Địa chỉ" },
+            schoolCode: { type: "STRING", description: "Mã cơ sở giáo dục" },
+            facilityName: { type: "STRING", description: "Cơ sở kiểm tra sức khoẻ" },
+            examinationDate: { type: "STRING", description: "Ngày khám" },
+            height: { type: "NUMBER", description: "Chiều cao (cm)" },
+            weight: { type: "NUMBER", description: "Cân nặng (kg)" },
+            bmi: { type: "STRING", description: "Chỉ số BMI" },
+            pulse: { type: "INTEGER", description: "Mạch" },
+            bloodPressure: { type: "STRING", description: "Huyết áp" },
+            eyeOtherDiseases: { type: "STRING", description: "Khám Mắt - Bệnh khác" },
+            entOtherDiseases: { type: "STRING", description: "Khám Tai Mũi Họng - Bệnh khác" },
+            upperJawExamination: { type: "STRING", description: "RHM - Hàm trên" },
+            lowerJawExamination: { type: "STRING", description: "RHM - Hàm dưới" },
+            dentalOtherDiseases: { type: "STRING", description: "RHM - Bệnh khác" },
+            prolongedSadnessAnxietyInsomniaNote: { type: "STRING", description: "Sự buồn bã, lo âu kéo dài, mất ngủ" },
+            abnormalBehaviorSelfHarmRiskNote: { type: "STRING", description: "Hành vi bất thường, tự hủy hoại bản thân" },
+            healthIssuesNote: { type: "STRING", description: "Kết luận - Các vấn đề sức khỏe" },
+            referToFacilityDetail: { type: "STRING", description: "Chuyển tuyến cơ sở KBCB" }
+          }
+        }
+      };
+
+    } else {
+      // Logic cũ cho Người lớn (ADULT_18)
+      prompt = `Bạn là một chuyên gia đọc hồ sơ khám sức khỏe. Hãy đọc các trang scan và nhóm lại theo từng bệnh nhân (dựa vào Tên, Năm sinh, Mã ID).
 Trích xuất thông tin thành MẢNG JSON tuyệt đối chính xác theo cấu trúc dưới đây.
 
 CÁC QUY TẮC BẮT BUỘC:
@@ -71,8 +118,11 @@ CÁC QUY TẮC BẮT BUỘC:
     "CAC_BENH_TAT_NEU_CO": "Tương tự kết luận bệnh"
   }
 ]`;
+      // Không ép Schema cho 18+ để giữ nguyên độ ổn định của prompt text hiện tại.
+    }
 
-    const requestBody = {
+    // 3. GỌI API GEMINI
+    const requestBody: any = {
       contents: [{ parts: [{ text: prompt }, ...imageParts] }],
       generationConfig: { 
         temperature: 0,
@@ -85,6 +135,11 @@ CÁC QUY TẮC BẮT BUỘC:
         { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
       ]
     };
+
+    // Chỉ chèn responseSchema nếu có (tránh lỗi với cấu hình cũ)
+    if (responseSchema) {
+      requestBody.generationConfig.responseSchema = responseSchema;
+    }
 
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`, {
       method: "POST",
@@ -101,73 +156,67 @@ CÁC QUY TẮC BẮT BUỘC:
     const cleanJsonText = textResult.replace(/```json/g, "").replace(/```/g, "").trim();
     const rawPatients = JSON.parse(cleanJsonText);
 
+    let cleanedPatients = rawPatients;
+
     // ==========================================
-    // HÀM CHUẨN HÓA DỮ LIỆU THÔNG MINH
+    // 4. CHỈ CHẠY LOGIC CHUẨN HÓA DỮ LIỆU CHO HỒ SƠ 18+
     // ==========================================
-    const cleanedPatients = rawPatients.map((patient: any) => {
-      const p = { ...patient };
+    if (docType === "ADULT_18") {
+      cleanedPatients = rawPatients.map((patient: any) => {
+        const p = { ...patient };
 
-      // ----------------------------------------
-      // 1. XỬ LÝ TAI (NÓI THƯỜNG & NÓI THẦM)
-      // ----------------------------------------
-      const cleanDistance = (val: any, defaultVal: string) => {
-        if (!val || String(val).trim() === "") return defaultVal;
-        // Xóa sạch chữ 'm', 'M', khoảng trắng, giữ lại số và dấu chấm/phẩy
-        let cleaned = String(val).replace(/[mM\s]/g, "").replace(",", ".").trim();
-        return cleaned || defaultVal;
-      };
+        // XỬ LÝ TAI (NÓI THƯỜNG & NÓI THẦM)
+        const cleanDistance = (val: any, defaultVal: string) => {
+          if (!val || String(val).trim() === "") return defaultVal;
+          let cleaned = String(val).replace(/[mM\s]/g, "").replace(",", ".").trim();
+          return cleaned || defaultVal;
+        };
 
-      p["TAI_PHAI_NOI_THUONG"] = cleanDistance(p["TAI_PHAI_NOI_THUONG"], "5");
-      p["TAI_TRAI_NOI_THUONG"] = cleanDistance(p["TAI_TRAI_NOI_THUONG"], "5");
-      p["TAI_PHAI_NOI_THAM"]   = cleanDistance(p["TAI_PHAI_NOI_THAM"], "0.5");
-      p["TAI_TRAI_NOI_THAM"]   = cleanDistance(p["TAI_TRAI_NOI_THAM"], "0.5");
+        p["TAI_PHAI_NOI_THUONG"] = cleanDistance(p["TAI_PHAI_NOI_THUONG"], "5");
+        p["TAI_TRAI_NOI_THUONG"] = cleanDistance(p["TAI_TRAI_NOI_THUONG"], "5");
+        p["TAI_PHAI_NOI_THAM"]   = cleanDistance(p["TAI_PHAI_NOI_THAM"], "0.5");
+        p["TAI_TRAI_NOI_THAM"]   = cleanDistance(p["TAI_TRAI_NOI_THAM"], "0.5");
 
-      // ----------------------------------------
-      // 2. LOGIC ÉP PHÂN LOẠI SỨC KHỎE (1-5)
-      // ----------------------------------------
-      const clinicalPairs = [
-        ["NOI_KHOA_TUAN_HOAN", "NOI_KHOA_TUAN_HOAN_PL"],
-        ["NOI_KHOA_HO_HAP", "NOI_KHOA_HO_HAP_PL"],
-        ["NOI_KHOA_TIEU_HOA", "NOI_KHOA_TIEU_HOA_PL"],
-        ["NOI_KHOA_THAN_TN_SD", "NOI_KHOA_THAN_TIETNIEU_PL"],
-        ["NOI_KHOA_NOI_TIET", "NOI_KHOA_NOI_TIET_PL"],
-        ["NOI_KHOA_CO_XUONG_KHOP", "NOI_KHOA_CO_XUONG_KHOP_PL"],
-        ["NOI_KHOA_THAN_KINH", "NOI_KHOA_THAN_KINH_PL"],
-        ["NOI_KHOA_TAM_THAN", "NOI_KHOA_TAM_THAN_PL"],
-        ["KET_QUA_KHAM_NGOAI_KHOA", "KHAM_NGOAI_KHOA_PL"],
-        ["KET_QUA_KHAM_DA_LIEU", "KHAM_DA_LIEU_PL"],
-        ["BENH_KHAC_MAT", "KHAM_MAT_PL"],
-        ["BENH_KHAC_TAI_MUI_HONG", "KHAM_TAI_MUI_HONG_PL"],
-        ["BENH_KHAC_RANG_HAM_MAT", "KHAM_RANG_HAM_MAT_PL"]
-      ];
+        // LOGIC ÉP PHÂN LOẠI SỨC KHỎE (1-5)
+        const clinicalPairs = [
+          ["NOI_KHOA_TUAN_HOAN", "NOI_KHOA_TUAN_HOAN_PL"],
+          ["NOI_KHOA_HO_HAP", "NOI_KHOA_HO_HAP_PL"],
+          ["NOI_KHOA_TIEU_HOA", "NOI_KHOA_TIEU_HOA_PL"],
+          ["NOI_KHOA_THAN_TN_SD", "NOI_KHOA_THAN_TIETNIEU_PL"],
+          ["NOI_KHOA_NOI_TIET", "NOI_KHOA_NOI_TIET_PL"],
+          ["NOI_KHOA_CO_XUONG_KHOP", "NOI_KHOA_CO_XUONG_KHOP_PL"],
+          ["NOI_KHOA_THAN_KINH", "NOI_KHOA_THAN_KINH_PL"],
+          ["NOI_KHOA_TAM_THAN", "NOI_KHOA_TAM_THAN_PL"],
+          ["KET_QUA_KHAM_NGOAI_KHOA", "KHAM_NGOAI_KHOA_PL"],
+          ["KET_QUA_KHAM_DA_LIEU", "KHAM_DA_LIEU_PL"],
+          ["BENH_KHAC_MAT", "KHAM_MAT_PL"],
+          ["BENH_KHAC_TAI_MUI_HONG", "KHAM_TAI_MUI_HONG_PL"],
+          ["BENH_KHAC_RANG_HAM_MAT", "KHAM_RANG_HAM_MAT_PL"]
+        ];
 
-      clinicalPairs.forEach(([descKey, plKey]) => {
-        const descVal = String(p[descKey] || "").toLowerCase().trim();
-        const plVal = String(p[plKey] || "").trim();
+        clinicalPairs.forEach(([descKey, plKey]) => {
+          const descVal = String(p[descKey] || "").toLowerCase().trim();
+          const plVal = String(p[plKey] || "").trim();
 
-        if (
-          !descVal || 
-          descVal.includes("bình thường") || 
-          descVal.includes("bất thường") || 
-          descVal === "bt"
-        ) {
-          p[plKey] = "1";
-        } else {
-          // Xử lý nhẹ nếu AI có bệnh nhưng vẫn đọc nhầm số La Mã
-          if (["1", "I", "|"].includes(plVal)) p[plKey] = "1";
-          else if (["2", "II", "11", "||"].includes(plVal)) p[plKey] = "2";
-          else if (["3", "III", "111", "|||"].includes(plVal)) p[plKey] = "3";
-          else if (["4", "IV", "1V", "14"].includes(plVal)) p[plKey] = "4";
-          else if (["5", "V", "15"].includes(plVal)) p[plKey] = "5";
-        }
+          if (!descVal || descVal.includes("bình thường") || descVal.includes("bất thường") || descVal === "bt") {
+            p[plKey] = "1";
+          } else {
+            if (["1", "I", "|"].includes(plVal)) p[plKey] = "1";
+            else if (["2", "II", "11", "||"].includes(plVal)) p[plKey] = "2";
+            else if (["3", "III", "111", "|||"].includes(plVal)) p[plKey] = "3";
+            else if (["4", "IV", "1V", "14"].includes(plVal)) p[plKey] = "4";
+            else if (["5", "V", "15"].includes(plVal)) p[plKey] = "5";
+          }
+        });
+
+        if (!p["KHAM_THE_LUC_PL"] || String(p["KHAM_THE_LUC_PL"]).trim() === "") p["KHAM_THE_LUC_PL"] = "1";
+        if (!p["PHAN_LOAI_SK"] || String(p["PHAN_LOAI_SK"]).trim() === "") p["PHAN_LOAI_SK"] = "1";
+
+        return p;
       });
-
-      // Xử lý riêng cho Thể lực & Phân loại chung
-      if (!p["KHAM_THE_LUC_PL"] || String(p["KHAM_THE_LUC_PL"]).trim() === "") p["KHAM_THE_LUC_PL"] = "1";
-      if (!p["PHAN_LOAI_SK"] || String(p["PHAN_LOAI_SK"]).trim() === "") p["PHAN_LOAI_SK"] = "1";
-
-      return p;
-    });
+    } else if (docType === "STUDENT") {
+      // Bạn có thể thêm các logic làm sạch dữ liệu riêng cho Học Sinh vào đây sau này
+    }
 
     return NextResponse.json({ patients: cleanedPatients });
 

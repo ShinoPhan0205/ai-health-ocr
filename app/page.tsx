@@ -21,7 +21,7 @@ interface PatientData {
 export default function OCRPage() {
   const [allPdfPages, setAllPdfPages] = useState<ValidPage[]>([]);
   const [reconciledData, setReconciledData] = useState<PatientData[]>([]);
-  
+  const [docType, setDocType] = useState("ADULT_18");
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
   
@@ -91,13 +91,14 @@ export default function OCRPage() {
       pageNumber: p.pageNumber,
       base64: p.base64 // Chỉ lấy ảnh mờ
     }));
-
+    
     for (let i = 0; i < retries; i++) {
       try {
         const res = await fetch("/api/extract", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ modelId, pages: aiPayload }), // Gửi mảng đã lọc
+          // 👉 THÊM docType VÀO ĐÂY:
+          body: JSON.stringify({ modelId, pages: aiPayload, docType: docType }), 
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Lỗi API");
