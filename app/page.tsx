@@ -766,19 +766,17 @@ export default function OCRPage() {
                   <span style={{ fontWeight: patientIndex === idx ? "bold" : "normal", fontSize: "14px", flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>{name}</span>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
                     {hasConflict ? (
-                      <AlertTriangle
-                        size={16}
-                        color="#ef4444"
-                        title={`${unresolvedClinicalFields.length} trường khám chưa được xác nhận`}
-                      />
+                      <span title={`${unresolvedClinicalFields.length} trường khám chưa được xác nhận`}>
+                        <AlertTriangle size={16} color="#ef4444" />
+                      </span>
                     ) : hasModelWarning ? (
-                      <AlertTriangle
-                        size={16}
-                        color="#f59e0b"
-                        title="Một model chưa trả kết quả cho hồ sơ này; cần kiểm tra riêng"
-                      />
+                      <span title="Một model chưa trả kết quả cho hồ sơ này; cần kiểm tra riêng">
+                        <AlertTriangle size={16} color="#f59e0b" />
+                      </span>
                     ) : (
-                      <CheckCircle size={16} color="#10b981" title="Đã xử lý hết các trường cần đối chiếu" />
+                      <span title="Đã xử lý hết các trường cần đối chiếu">
+                        <CheckCircle size={16} color="#10b981" />
+                      </span>
                     )}
                     <button
                       type="button"
