@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "exceljs": "^4.4.0",
     "idb-keyval": "^6.3.0",
     "localforage": "^1.10.0",
     "lucide-react": "^1.70.0",
@@ -16,6 +17,7 @@
     "pdfjs-dist": "^6.5.438",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "tesseract.js": "^7.0.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
