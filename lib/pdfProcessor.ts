@@ -21,16 +21,14 @@ export interface ValidPage {
 function hasVisibleContent(
   context: CanvasRenderingContext2D,
   width: number,
-  height: number
+  height: number,
+  sampleCanvas: HTMLCanvasElement,
+  sampleContext: CanvasRenderingContext2D
 ): boolean {
   const sampleWidth = Math.min(180, width);
   const sampleHeight = Math.max(1, Math.round((height / width) * sampleWidth));
-  const sampleCanvas = document.createElement("canvas");
   sampleCanvas.width = sampleWidth;
   sampleCanvas.height = sampleHeight;
-
-  const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
-  if (!sampleContext) return true;
 
   sampleContext.drawImage(context.canvas, 0, 0, sampleWidth, sampleHeight);
   const pixels = sampleContext.getImageData(0, 0, sampleWidth, sampleHeight).data;
@@ -41,8 +39,6 @@ function hasVisibleContent(
     if (pixels[i] < 245 || pixels[i + 1] < 245 || pixels[i + 2] < 245) darkPixels++;
   }
 
-  sampleCanvas.width = 0;
-  sampleCanvas.height = 0;
   return darkPixels / totalPixels >= 0.0005;
 }
 
@@ -84,33 +80,59 @@ function classifyHeader(text: string): DocumentMarker {
  *   Trang xét nghiệm và các trang xét nghiệm lưu trữ tiếp theo không được gửi Gemini.
  * OCR chỉ nhận diện tiêu đề; không đọc nội dung khám/xét nghiệm và không thay thế Gemini.
  */
-export async function extractAndFilterPages(file: File): Promise<ValidPage[][]> {
+export async function extractAndFilterPages(
+  file: File,
+  onProgress?: (processedPages: number, totalPages: number) => void
+): Promise<ValidPage[][]> {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const validPages: ValidPage[] = [];
+  const ocrWorkers: any[] = [];
+  let processedPages = 0;
 
-  const displayCanvas = document.createElement("canvas");
-  const displayContext = displayCanvas.getContext("2d", { willReadFrequently: true });
-  const aiCanvas = document.createElement("canvas");
-  const aiContext = aiCanvas.getContext("2d", { willReadFrequently: true });
-  const headerCanvas = document.createElement("canvas");
-  const headerContext = headerCanvas.getContext("2d", { willReadFrequently: true });
+  // Hai worker chỉ được bật cho PDF dài và máy có đủ luồng CPU.
+  // Máy yếu/PDF ngắn vẫn dùng một worker như luồng cũ để tránh tăng tải bộ nhớ.
+  const logicalCores = typeof navigator !== "undefined"
+    ? (navigator.hardwareConcurrency || 2)
+    : 2;
+  const desiredWorkerCount = pdf.numPages >= 20 && logicalCores >= 4 ? 2 : 1;
 
-  if (!displayContext || !aiContext || !headerContext) {
-    await pdf.cleanup();
-    throw new Error("Trình duyệt không thể khởi tạo canvas để đọc PDF.");
-  }
-
-  let ocrWorker: any = null;
   try {
-    // Tải Tesseract.js động để thư viện OCR chỉ được khởi tạo ở trình duyệt.
     const { createWorker } = await import("tesseract.js");
-    ocrWorker = await createWorker("vie");
-    await ocrWorker.setParameters({ tessedit_pageseg_mode: "6" });
 
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
-      const page = await pdf.getPage(pageNumber);
+    // Nếu không khởi tạo được worker thứ hai, tự động quay về một worker.
+    for (let i = 0; i < desiredWorkerCount; i++) {
+      let worker: any = null;
       try {
+        worker = await createWorker("vie");
+        await worker.setParameters({ tessedit_pageseg_mode: "6" });
+        ocrWorkers.push(worker);
+      } catch (workerError) {
+        if (worker) await worker.terminate().catch(() => undefined);
+        if (ocrWorkers.length === 0) throw workerError;
+        console.warn("Không khởi tạo được OCR worker bổ sung; tiếp tục bằng số worker hiện có.", workerError);
+        break;
+      }
+    }
+
+    const processPage = async (pageNumber: number, ocrWorker: any): Promise<ValidPage | null> => {
+      const page = await pdf.getPage(pageNumber);
+      const displayCanvas = document.createElement("canvas");
+      const aiCanvas = document.createElement("canvas");
+      const headerCanvas = document.createElement("canvas");
+      const sampleCanvas = document.createElement("canvas");
+
+      try {
+        const displayContext = displayCanvas.getContext("2d", { willReadFrequently: true });
+        const aiContext = aiCanvas.getContext("2d", { willReadFrequently: true });
+        const headerContext = headerCanvas.getContext("2d", { willReadFrequently: true });
+        const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
+
+        if (!displayContext || !aiContext || !headerContext || !sampleContext) {
+          throw new Error("Trình duyệt không thể khởi tạo canvas để đọc PDF.");
+        }
+
+        // Giữ nguyên độ phân giải và chất lượng ảnh hiển thị như phiên bản trước.
         const displayViewport = page.getViewport({ scale: 1.8 });
         displayCanvas.width = Math.ceil(displayViewport.width);
         displayCanvas.height = Math.ceil(displayViewport.height);
@@ -118,18 +140,26 @@ export async function extractAndFilterPages(file: File): Promise<ValidPage[][]> 
         displayContext.fillRect(0, 0, displayCanvas.width, displayCanvas.height);
         await page.render({ canvasContext: displayContext, viewport: displayViewport } as any).promise;
 
-        if (!hasVisibleContent(displayContext, displayCanvas.width, displayCanvas.height)) continue;
+        if (!hasVisibleContent(
+          displayContext,
+          displayCanvas.width,
+          displayCanvas.height,
+          sampleCanvas,
+          sampleContext
+        )) return null;
 
         const displayBase64 = displayCanvas.toDataURL("image/jpeg", 0.82);
 
-        // Chỉ cắt 34% phía trên trang để OCR tiêu đề, không OCR toàn trang.
-        headerCanvas.width = displayCanvas.width;
-        headerCanvas.height = Math.max(1, Math.floor(displayCanvas.height * 0.34));
+        // Giữ nguyên vùng OCR 34% đầu trang, chiều rộng tối đa 760px và PSM 6.
+        const headerSourceHeight = Math.max(1, Math.floor(displayCanvas.height * 0.34));
+        const headerScale = Math.min(1, 760 / displayCanvas.width);
+        headerCanvas.width = Math.max(1, Math.round(displayCanvas.width * headerScale));
+        headerCanvas.height = Math.max(1, Math.round(headerSourceHeight * headerScale));
         headerContext.fillStyle = "#ffffff";
         headerContext.fillRect(0, 0, headerCanvas.width, headerCanvas.height);
         headerContext.drawImage(
           displayCanvas,
-          0, 0, displayCanvas.width, headerCanvas.height,
+          0, 0, displayCanvas.width, headerSourceHeight,
           0, 0, headerCanvas.width, headerCanvas.height
         );
 
@@ -138,32 +168,73 @@ export async function extractAndFilterPages(file: File): Promise<ValidPage[][]> 
           const ocrResult = await ocrWorker.recognize(headerCanvas);
           headerText = ocrResult?.data?.text || "";
         } catch (ocrError) {
+          // Giữ nguyên hành vi cũ: lỗi OCR một trang không làm hỏng toàn bộ PDF.
           console.warn(`Không OCR được vùng đầu trang ${pageNumber}:`, ocrError);
         }
 
         const documentMarker = classifyHeader(headerText);
 
+        // Giữ nguyên cách tạo ảnh AI từ canvas gốc trước nén, scale 1.0 và JPEG 0.62.
         const aiViewport = page.getViewport({ scale: 1.0 });
         aiCanvas.width = Math.ceil(aiViewport.width);
         aiCanvas.height = Math.ceil(aiViewport.height);
         aiContext.fillStyle = "#ffffff";
         aiContext.fillRect(0, 0, aiCanvas.width, aiCanvas.height);
-        await page.render({ canvasContext: aiContext, viewport: aiViewport } as any).promise;
+        aiContext.drawImage(
+          displayCanvas,
+          0, 0, displayCanvas.width, displayCanvas.height,
+          0, 0, aiCanvas.width, aiCanvas.height
+        );
 
         const base64 = aiCanvas.toDataURL("image/jpeg", 0.62);
-        validPages.push({ pageNumber, base64, displayBase64, documentMarker, headerText });
+        return { pageNumber, base64, displayBase64, documentMarker, headerText };
       } finally {
         page.cleanup();
+        // Thu hồi bộ nhớ canvas ngay sau mỗi trang, kể cả khi OCR/render gặp lỗi.
+        displayCanvas.width = 0;
+        displayCanvas.height = 0;
+        aiCanvas.width = 0;
+        aiCanvas.height = 0;
+        headerCanvas.width = 0;
+        headerCanvas.height = 0;
+        sampleCanvas.width = 0;
+        sampleCanvas.height = 0;
+
+        processedPages++;
+        if (onProgress && (
+          processedPages === 1 ||
+          processedPages % 2 === 0 ||
+          processedPages === pdf.numPages
+        )) {
+          onProgress(processedPages, pdf.numPages);
+        }
+      }
+    };
+
+    // Xử lý theo từng nhóm nhỏ, giữ nguyên thứ tự trang trong kết quả.
+    // Promise.allSettled bảo đảm cả trang còn lại trong nhóm kết thúc và được dọn
+    // tài nguyên trước khi xử lý lỗi, tránh terminate worker khi nó còn đang OCR.
+    const concurrency = Math.max(1, ocrWorkers.length);
+    for (let firstPage = 1; firstPage <= pdf.numPages; firstPage += concurrency) {
+      const pageNumbers = Array.from(
+        { length: Math.min(concurrency, pdf.numPages - firstPage + 1) },
+        (_, offset) => firstPage + offset
+      );
+
+      const settled = await Promise.allSettled(
+        pageNumbers.map((pageNumber, index) => processPage(pageNumber, ocrWorkers[index]))
+      );
+
+      const failed = settled.find((item): item is PromiseRejectedResult => item.status === "rejected");
+      if (failed) throw failed.reason;
+
+      // Promise.allSettled giữ thứ tự đầu vào; trang trắng vẫn được lọc như cũ.
+      for (const item of settled) {
+        if (item.status === "fulfilled" && item.value) validPages.push(item.value);
       }
     }
   } finally {
-    if (ocrWorker) await ocrWorker.terminate();
-    displayCanvas.width = 0;
-    displayCanvas.height = 0;
-    aiCanvas.width = 0;
-    aiCanvas.height = 0;
-    headerCanvas.width = 0;
-    headerCanvas.height = 0;
+    await Promise.allSettled(ocrWorkers.map(worker => worker.terminate()));
     await pdf.cleanup();
   }
 

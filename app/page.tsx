@@ -61,6 +61,42 @@ export default function OCRPage() {
   const [status, setStatus] = useState("");
   const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
   const [sessionLoaded, setSessionLoaded] = useState(false);
+  // Theo dõi khi người dùng chuyển sang tab khác để hiển thị trạng thái chạy nền.
+  const [isTabHidden, setIsTabHidden] = useState(false);
+  const originalDocumentTitleRef = useRef<string | null>(null);
+
+  // Tác vụ upload PDF và Dual AI vẫn chạy trong vòng đời của tab này khi tab bị ẩn.
+  // Đổi tiêu đề tab để người dùng nhận biết ứng dụng đang tiếp tục xử lý ở nền.
+  useEffect(() => {
+    if (originalDocumentTitleRef.current === null) {
+      originalDocumentTitleRef.current = document.title;
+    }
+
+    const syncBackgroundState = () => {
+      const hidden = document.visibilityState === "hidden";
+      setIsTabHidden(hidden);
+      if (loading) {
+        document.title = hidden
+          ? "⏳ Đang chạy nền | Hệ thống KSK"
+          : "⏳ Đang xử lý | Hệ thống KSK";
+      } else {
+        document.title = originalDocumentTitleRef.current || "Hệ thống KSK";
+      }
+    };
+
+    syncBackgroundState();
+    document.addEventListener("visibilitychange", syncBackgroundState);
+    return () => document.removeEventListener("visibilitychange", syncBackgroundState);
+  }, [loading]);
+
+  // Khôi phục tiêu đề ban đầu khi rời trang.
+  useEffect(() => {
+    return () => {
+      if (originalDocumentTitleRef.current !== null) {
+        document.title = originalDocumentTitleRef.current;
+      }
+    };
+  }, []);
 
   // State điều hướng
   const [patientIndex, setPatientIndex] = useState(0);
@@ -153,12 +189,15 @@ export default function OCRPage() {
       await del('saved_pdf_pages');
       await del('saved_reconciled_data');
 
-      const result: ValidPage[][] = await extractAndFilterPages(file);
+      const result: ValidPage[][] = await extractAndFilterPages(file, (processed, total) => {
+        setStatus(`Đang bóc tách và nén ảnh: ${processed}/${total} trang PDF...`);
+      });
       const flatPages: ValidPage[] = result.flat();
 
       setAllPdfPages(flatPages);
 
-      // Lưu file mới vào IndexedDB ngay lập tức
+      // Phân biệt thời gian bóc tách với thời gian lưu cache để dễ nhận ra nút thắt.
+      setStatus(`Đã bóc tách ${flatPages.length} trang có dữ liệu. Đang lưu phiên làm việc...`);
       await set('saved_pdf_pages', flatPages);
 
       setStatus(`✅ Đã xử lý xong. Lọc được ${flatPages.length} trang có dữ liệu.`);
@@ -210,6 +249,7 @@ export default function OCRPage() {
       const allM1Patients: any[] = [];
       const allM2Patients: any[] = [];
       let adultRanges: Array<{ id: number; start: number; end: number }> = [];
+      let skippedIncompleteNotice = "";
 
       if (docType === "ADULT_18") {
         // Ranh giới bệnh nhân do OCR vùng đầu trang xác định, Gemini không tự chia nhóm.
@@ -224,24 +264,51 @@ export default function OCRPage() {
           throw new Error("OCR chưa nhận diện được tiêu đề giấy khám sức khỏe người từ đủ 18 tuổi. Vui lòng kiểm tra vùng đầu trang hoặc tải lại PDF.");
         }
 
-        adultRanges = starts.map((start, id) => {
+        // Nếu PDF được cắt từ giữa một tập hồ sơ, bỏ qua phần đầu cho đến
+        // PATIENT_START đầu tiên. Không cố đoán hoặc ghép phần đầu đó vào bệnh nhân mới.
+        const leadingPagesNotice = starts[0] > 0
+          ? ` Đã tự động bỏ qua các trang đầu file trước trang PDF ${allPdfPages[starts[0]].pageNumber} vì chưa có dấu bắt đầu hồ sơ.`
+          : "";
+
+        // Không để một hồ sơ bị cắt dở (thường là hồ sơ cuối file do người dùng
+        // chia PDF) chặn các hồ sơ hoàn chỉnh đứng trước. Giữ nguyên id gốc của
+        // starts để segment_index M1/M2 vẫn khớp sau khi lọc hồ sơ thiếu.
+        const skippedIncompleteRanges: Array<{ id: number; start: number }> = [];
+        const detectedRanges = starts.map((start, id) => {
           const nextStart = starts[id + 1] ?? allPdfPages.length;
           const labIndex = labs.find(index => index >= start && index < nextStart);
           if (labIndex === undefined) {
-            throw new Error(`Không tìm thấy tiêu đề PHIẾU KẾT QUẢ XÉT NGHIỆM trong hồ sơ bắt đầu ở trang PDF ${allPdfPages[start].pageNumber}. Hồ sơ chưa được gửi AI để tránh ghép thiếu.`);
+            skippedIncompleteRanges.push({ id, start });
+            return null;
           }
 
           // Tiêu đề phiếu xét nghiệm là dấu kết thúc hồ sơ khám.
           // Không đưa trang xét nghiệm này hoặc các trang lưu trữ tiếp theo vào Gemini/Excel.
           const end = labIndex - 1;
           if (end < start) {
-            throw new Error(`Hồ sơ bắt đầu ở trang PDF ${allPdfPages[start].pageNumber} không có trang khám nào trước phiếu xét nghiệm.`);
-          }
-          if (id === 0 && start !== 0) {
-            throw new Error(`Có ${start} trang hợp lệ ở đầu PDF chưa được gắn với hồ sơ bệnh nhân. Không tự ý bỏ qua các trang này.`);
+            skippedIncompleteRanges.push({ id, start });
+            return null;
           }
           return { id, start, end };
         });
+        adultRanges = detectedRanges.filter(
+          (range): range is { id: number; start: number; end: number } => range !== null
+        );
+
+        const skippedStartPages = skippedIncompleteRanges.map(
+          item => allPdfPages[item.start].pageNumber
+        );
+        skippedIncompleteNotice = skippedStartPages.length > 0
+          ? ` Đã bỏ qua ${skippedStartPages.length} hồ sơ chưa đủ thành phần bắt buộc (bắt đầu tại trang PDF ${skippedStartPages.slice(0, 10).join(", ")}${skippedStartPages.length > 10 ? ` và ${skippedStartPages.length - 10} hồ sơ khác` : ""}); các hồ sơ này không được gửi AI.`
+          : "";
+
+        // Nếu không còn hồ sơ hợp lệ thì dừng trước khi gọi API, nhưng không
+        // biến hồ sơ thiếu thành lỗi làm mất các kết quả hợp lệ (vì lúc này không có hồ sơ hợp lệ).
+        if (adultRanges.length === 0) {
+          throw new Error(
+            `Không có hồ sơ nào đủ thành phần bắt buộc để gửi AI.${skippedIncompleteNotice || " Vui lòng kiểm tra PDF và dấu mốc OCR."}`
+          );
+        }
 
         // Các trang từ tiêu đề PHIẾU KẾT QUẢ XÉT NGHIỆM trở đi là tài liệu lưu trữ.
         // Chúng vẫn nằm trong allPdfPages để xem ảnh gốc, nhưng không thuộc dữ liệu khám gửi AI.
@@ -291,7 +358,7 @@ export default function OCRPage() {
           }
 
           batchNumber++;
-          setStatus(`🧠 OCR đã chia ranh giới. Đang gửi đợt ${batchNumber} — ${batchRanges.length} hồ sơ, ${batchPages.length}/15 trang khám cho M1 và M2 (không gửi phiếu xét nghiệm)...`);
+          setStatus(`🧠 OCR đã chia ranh giới. Đang gửi đợt ${batchNumber} — ${batchRanges.length} hồ sơ, ${batchPages.length}/15 trang khám cho M1 và M2 (không gửi phiếu xét nghiệm)...${batchNumber === 1 ? leadingPagesNotice + skippedIncompleteNotice : ""}`);
 
           const [res1, res2] = await Promise.all([
             fetchWithRetry("MODEL_1", batchPages, 3, requestRanges),
@@ -488,7 +555,7 @@ export default function OCRPage() {
       setPatientIndex(0);
       setGlobalImageIndex(0);
       const needsReview = allReconciledData.filter(p => p._groupingWarning).length;
-      setStatus(`🎉 Hoàn tất ${allReconciledData.length} hồ sơ. ${needsReview ? `Có ${needsReview} hồ sơ cần kiểm tra do thiếu kết quả từ một model.` : "M1 và M2 đã được đối chiếu theo đúng ranh giới OCR."}`);
+      setStatus(`🎉 Hoàn tất ${allReconciledData.length} hồ sơ. ${needsReview ? `Có ${needsReview} hồ sơ cần kiểm tra do thiếu kết quả từ một model.` : "M1 và M2 đã được đối chiếu theo đúng ranh giới OCR."}${skippedIncompleteNotice}`);
     } catch (error: any) {
       console.error(error);
       setStatus("❌ Lỗi: " + error.message);
@@ -727,6 +794,12 @@ export default function OCRPage() {
       <div style={{ marginBottom: "20px", padding: "10px", background: "#f3f4f6", borderRadius: "8px" }}>
         <strong>Trạng thái: </strong> {status || "Chưa có file nào được tải lên."}
       </div>
+
+      {loading && (
+        <div style={{ marginTop: "-10px", marginBottom: "20px", padding: "10px 12px", background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: "8px", color: "#1e40af", fontSize: "14px" }}>
+          <strong>⏳ Tác vụ đang chạy.</strong> Bạn có thể chuyển sang tab Google hoặc tab khác để làm việc. {isTabHidden ? "Tab xử lý hiện đang ở chế độ nền." : "Khi chuyển tab, tiêu đề tab sẽ đổi thành ‘Đang chạy nền’."} Vui lòng không đóng tab này hoặc đóng trình duyệt cho đến khi hoàn tất.
+        </div>
+      )}
 
       {isWorkspaceReady && currentPatientData && (
         <div style={{ display: "flex", gap: "20px", height: "80vh" }}>
