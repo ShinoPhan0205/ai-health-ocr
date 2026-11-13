@@ -4,7 +4,14 @@ import { NextResponse } from "next/server";
 export const maxDuration = 60;
 
 export async function POST(req: Request) {
+  const routeStartedAt = Date.now();
+  let requestPrepMs = 0;
+  let geminiWaitMs = 0;
+  let parseResultMs = 0;
+  let normalizationMs = 0;
+  let requestPageCount = 0;
   try {
+    const requestParseStartedAt = Date.now();
     // 1. NHẬN THÊM docType TỪ FRONTEND
     const { pages, modelId, docType = "ADULT_18", patientRanges } = await req.json();
     if (!Array.isArray(pages) || pages.length === 0 || pages.length > 15) {
@@ -50,6 +57,8 @@ export async function POST(req: Request) {
     const imageParts = pages.map((page: any) => ({
       inlineData: { mimeType: "image/jpeg", data: page.base64.split(",")[1] }
     }));
+    requestPageCount = pages.length;
+    requestPrepMs = Date.now() - requestParseStartedAt;
 
     // 2. CẤU HÌNH PROMPT VÀ JSON SCHEMA THEO TỪNG LOẠI HỒ SƠ
     let prompt = "";
@@ -117,7 +126,7 @@ YÊU CẦU TRÍCH XUẤT VÀ ĐỌC KHÁM LÂM SÀNG:
 2. segment_index phải được sao chép nguyên vẹn; page_start/page_end phải giữ đúng khoảng OCR cung cấp.
 3. Chỉ đọc trang thuộc đúng segment. Không lấy dữ liệu của bệnh nhân khác.
 4. Hai model hoạt động độc lập, tự đọc ảnh gốc; không giả định hoặc sao chép kết quả của model còn lại.
-5. Đọc lần lượt TẤT CẢ các trang trong segment. Không bỏ qua phần khám lâm sàng, dấu mộc, chữ viết tay, dấu tick, số phân loại hoặc kết luận nằm ở cuối trang.
+5. Đọc lần lượt TẤT CẢ các trang trong segment. Frontend đã giới hạn segment từ trang đầu phiếu khám đến trang có kết luận cuối cùng của bác sĩ; không yêu cầu phải có phiếu xét nghiệm và không tự kéo dài phạm vi sang phiếu xét nghiệm/phụ lục. Không bỏ qua phần khám lâm sàng, dấu mộc, chữ viết tay, dấu tick, số phân loại hoặc kết luận nằm ở cuối trang.
 6. Không để trống trường nếu trên ảnh có nội dung đọc được. Nếu thực sự không có nội dung hoặc không thể đọc sau khi đã xem kỹ thì mới trả chuỗi rỗng. Không tự bịa dữ liệu.
 7. Không dùng họ tên làm căn cứ thay đổi ranh giới.
 8. Đọc đầy đủ các câu hỏi tiền sử gia đình và tiền sử bản thân TSGD_* và TSBT_*. Với Có/Không, đọc dấu đánh dấu thực tế. Nếu biểu mẫu quy định mặc định là Không và không có dấu xác nhận Có thì dùng Không; nếu không xác định được dấu thì để trống.
@@ -259,6 +268,7 @@ QUY TẮC: page_start/page_end là chỉ số ảnh trong lô từ 0; không dù
       ]
     };
 
+    const geminiStartedAt = Date.now();
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
       {
@@ -269,8 +279,10 @@ QUY TẮC: page_start/page_end là chỉ số ảnh trong lô từ 0; không dù
     );
 
     const data = await response.json();
+    geminiWaitMs = Date.now() - geminiStartedAt;
     if (data.error) throw new Error(data.error.message);
 
+    const parseStartedAt = Date.now();
     const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!textResult) throw new Error("AI không trả về kết quả hợp lệ.");
 
@@ -299,8 +311,10 @@ QUY TẮC: page_start/page_end là chỉ số ảnh trong lô từ 0; không dù
     });
 
     let cleanedPatients = validatedPatients;
+    parseResultMs = Date.now() - parseStartedAt;
 
     // 4. CHUẨN HÓA DỮ LIỆU CHO ADULT_18
+    const normalizationStartedAt = Date.now();
     if (docType === "ADULT_18") {
       const normalizeForRules = (value: any) => String(value ?? "")
         .normalize("NFD")
@@ -517,7 +531,19 @@ QUY TẮC: page_start/page_end là chỉ số ảnh trong lô từ 0; không dù
       });
     }
 
-    return NextResponse.json({ patients: cleanedPatients });
+    normalizationMs = Date.now() - normalizationStartedAt;
+    const performanceMetrics = {
+      modelId,
+      pages: requestPageCount,
+      patientsReturned: cleanedPatients.length,
+      requestPrepMs,
+      geminiWaitMs,
+      parseResultMs,
+      normalizationMs,
+      totalServerMs: Date.now() - routeStartedAt
+    };
+    console.info("[KSK Performance] Extract API", performanceMetrics);
+    return NextResponse.json({ patients: cleanedPatients, performance: performanceMetrics });
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }

@@ -64,6 +64,7 @@ export default function OCRPage() {
   // Theo dõi khi người dùng chuyển sang tab khác để hiển thị trạng thái chạy nền.
   const [isTabHidden, setIsTabHidden] = useState(false);
   const originalDocumentTitleRef = useRef<string | null>(null);
+  const uploadPreparationMsRef = useRef(0);
 
   // Tác vụ upload PDF và Dual AI vẫn chạy trong vòng đời của tab này khi tab bị ẩn.
   // Đổi tiêu đề tab để người dùng nhận biết ứng dụng đang tiếp tục xử lý ở nền.
@@ -177,6 +178,7 @@ export default function OCRPage() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    const uploadStartedAt = Date.now();
     setLoading(true);
     setStatus(`Đang bóc tách và nén ảnh từ file ${file.name}...`);
     setAllPdfPages([]);
@@ -189,18 +191,32 @@ export default function OCRPage() {
       await del('saved_pdf_pages');
       await del('saved_reconciled_data');
 
+      const extractStartedAt = Date.now();
       const result: ValidPage[][] = await extractAndFilterPages(file, (processed, total) => {
         setStatus(`Đang bóc tách và nén ảnh: ${processed}/${total} trang PDF...`);
       });
+      const extractMs = Date.now() - extractStartedAt;
       const flatPages: ValidPage[] = result.flat();
 
       setAllPdfPages(flatPages);
 
       // Phân biệt thời gian bóc tách với thời gian lưu cache để dễ nhận ra nút thắt.
       setStatus(`Đã bóc tách ${flatPages.length} trang có dữ liệu. Đang lưu phiên làm việc...`);
+      const cacheStartedAt = Date.now();
       await set('saved_pdf_pages', flatPages);
+      const cacheSaveMs = Date.now() - cacheStartedAt;
+      const uploadTotalMs = Date.now() - uploadStartedAt;
+      uploadPreparationMsRef.current = uploadTotalMs;
+      console.groupCollapsed("[KSK Performance] Upload and PDF preparation");
+      console.table([
+        { stage: "PDF extraction/render/OCR/image encoding", durationMs: extractMs },
+        { stage: "IndexedDB cache save", durationMs: cacheSaveMs },
+        { stage: "Total upload preparation", durationMs: uploadTotalMs },
+        { stage: "Pages retained", durationMs: flatPages.length }
+      ]);
+      console.groupEnd();
 
-      setStatus(`✅ Đã xử lý xong. Lọc được ${flatPages.length} trang có dữ liệu.`);
+      setStatus(`✅ Đã xử lý xong. Lọc được ${flatPages.length} trang có dữ liệu (${(uploadTotalMs / 1000).toFixed(1)} giây).`);
     } catch (error: any) {
       setStatus(`❌ Lỗi đọc PDF: ${error.message}`);
     } finally {
@@ -215,6 +231,7 @@ export default function OCRPage() {
     retries = 3,
     patientRanges?: Array<{ segment_index: number; page_start: number; page_end: number }>
   ): Promise<any> {
+    const requestStartedAt = Date.now();
     const aiPayload = pages.map(p => ({ pageNumber: p.pageNumber, base64: p.base64 }));
 
     for (let i = 0; i < retries; i++) {
@@ -226,6 +243,13 @@ export default function OCRPage() {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Lỗi API");
+        console.info("[KSK Performance] Gemini request", {
+          model: modelId,
+          pages: pages.length,
+          attempt: i + 1,
+          clientRoundTripMs: Date.now() - requestStartedAt,
+          serverMetrics: data.performance || null
+        });
         return data;
       } catch (err: any) {
         if (i === retries - 1) throw err;
@@ -239,6 +263,7 @@ export default function OCRPage() {
   // --- 5. HÀM XỬ LÝ AI ---
   async function runDualAI() {
     if (allPdfPages.length === 0 || loading) return;
+    const aiRunStartedAt = Date.now();
     setLoading(true);
     setReconciledData([]);
     setPatientIndex(0);
@@ -252,7 +277,9 @@ export default function OCRPage() {
       let skippedIncompleteNotice = "";
 
       if (docType === "ADULT_18") {
-        // Ranh giới bệnh nhân do OCR vùng đầu trang xác định, Gemini không tự chia nhóm.
+        // PATIENT_START xác định đầu mỗi hồ sơ; patientEnd xác định trang kết luận
+        // cuối cùng. LAB_START chỉ còn là phương án dự phòng khi OCR không đọc được
+        // trang kết luận, không còn là điều kiện bắt buộc để hồ sơ được xử lý.
         const starts = allPdfPages
           .map((page, index) => page.documentMarker === "PATIENT_START" ? index : -1)
           .filter(index => index >= 0);
@@ -270,25 +297,39 @@ export default function OCRPage() {
           ? ` Đã tự động bỏ qua các trang đầu file trước trang PDF ${allPdfPages[starts[0]].pageNumber} vì chưa có dấu bắt đầu hồ sơ.`
           : "";
 
-        // Không để một hồ sơ bị cắt dở (thường là hồ sơ cuối file do người dùng
-        // chia PDF) chặn các hồ sơ hoàn chỉnh đứng trước. Giữ nguyên id gốc của
-        // starts để segment_index M1/M2 vẫn khớp sau khi lọc hồ sơ thiếu.
-        const skippedIncompleteRanges: Array<{ id: number; start: number }> = [];
+        // Giữ nguyên id gốc của starts để segment_index M1/M2 luôn khớp nhau,
+        // kể cả khi một hồ sơ phải bỏ qua vì chưa tìm thấy trang kết luận đáng tin cậy.
+        const skippedIncompleteRanges: Array<{ id: number; start: number; reason: string }> = [];
         const detectedRanges = starts.map((start, id) => {
           const nextStart = starts[id + 1] ?? allPdfPages.length;
           const labIndex = labs.find(index => index >= start && index < nextStart);
-          if (labIndex === undefined) {
-            skippedIncompleteRanges.push({ id, start });
+
+          // Ưu tiên trang có cả dấu hiệu phân loại sức khỏe chung và kết luận/bác sĩ.
+          // Không nhận diện trang xét nghiệm là trang kết luận.
+          const patientEndIndex = allPdfPages.findIndex((page, index) =>
+            index >= start && index < nextStart &&
+            (labIndex === undefined || index < labIndex) &&
+            page.patientEnd === true
+          );
+
+          let end = patientEndIndex;
+          if (end < 0 && labIndex !== undefined) {
+            // Tương thích với PDF cũ nếu OCR không nhận ra phần kết luận nhưng vẫn
+            // nhận ra tiêu đề phiếu xét nghiệm đứng ngay sau phiếu khám.
+            end = labIndex - 1;
+          }
+
+          if (end < start) {
+            skippedIncompleteRanges.push({
+              id,
+              start,
+              reason: labIndex === undefined
+                ? "không nhận diện được trang kết luận cuối cùng của bác sĩ"
+                : "không xác định được trang kết thúc trước phiếu xét nghiệm"
+            });
             return null;
           }
 
-          // Tiêu đề phiếu xét nghiệm là dấu kết thúc hồ sơ khám.
-          // Không đưa trang xét nghiệm này hoặc các trang lưu trữ tiếp theo vào Gemini/Excel.
-          const end = labIndex - 1;
-          if (end < start) {
-            skippedIncompleteRanges.push({ id, start });
-            return null;
-          }
           return { id, start, end };
         });
         adultRanges = detectedRanges.filter(
@@ -299,22 +340,26 @@ export default function OCRPage() {
           item => allPdfPages[item.start].pageNumber
         );
         skippedIncompleteNotice = skippedStartPages.length > 0
-          ? ` Đã bỏ qua ${skippedStartPages.length} hồ sơ chưa đủ thành phần bắt buộc (bắt đầu tại trang PDF ${skippedStartPages.slice(0, 10).join(", ")}${skippedStartPages.length > 10 ? ` và ${skippedStartPages.length - 10} hồ sơ khác` : ""}); các hồ sơ này không được gửi AI.`
+          ? ` Đã bỏ qua ${skippedStartPages.length} hồ sơ chưa xác định chắc chắn được trang kết luận (bắt đầu tại trang PDF ${skippedStartPages.slice(0, 10).join(", ")}${skippedStartPages.length > 10 ? ` và ${skippedStartPages.length - 10} hồ sơ khác` : ""}); các hồ sơ này không được gửi AI để tránh lấy nhầm trang xét nghiệm/phụ lục.`
           : "";
 
         // Nếu không còn hồ sơ hợp lệ thì dừng trước khi gọi API, nhưng không
-        // biến hồ sơ thiếu thành lỗi làm mất các kết quả hợp lệ (vì lúc này không có hồ sơ hợp lệ).
+        // biến hồ sơ thiếu thành dữ liệu suy đoán.
         if (adultRanges.length === 0) {
+          const reasonDetails = skippedIncompleteRanges.slice(0, 5).map(item =>
+            `trang PDF ${allPdfPages[item.start].pageNumber}: ${item.reason}`
+          ).join("; ");
           throw new Error(
-            `Không có hồ sơ nào đủ thành phần bắt buộc để gửi AI.${skippedIncompleteNotice || " Vui lòng kiểm tra PDF và dấu mốc OCR."}`
+            `Không xác định được phạm vi phiếu khám nào đủ tin cậy để gửi AI.${reasonDetails ? ` Chi tiết: ${reasonDetails}.` : " Vui lòng kiểm tra lại PDF."}`
           );
         }
 
-        // Các trang từ tiêu đề PHIẾU KẾT QUẢ XÉT NGHIỆM trở đi là tài liệu lưu trữ.
-        // Chúng vẫn nằm trong allPdfPages để xem ảnh gốc, nhưng không thuộc dữ liệu khám gửi AI.
+        // Chỉ đưa các trang từ đầu phiếu khám đến trang kết luận cuối cùng vào Gemini.
+        // Phiếu xét nghiệm và phụ lục phía sau vẫn được giữ trong allPdfPages để xem ảnh gốc.
 
-        // Chỉ tính các trang khám; trang phiếu xét nghiệm và phần tiếp theo không nằm trong phạm vi trích xuất.
-        // Một hồ sơ khám tối đa 15 trang/request. Nếu hồ sơ đơn lẻ dài hơn, dừng an toàn thay vì cắt đôi.
+        // Mỗi hồ sơ khám được gửi nguyên vẹn trong một request tối đa 15 trang.
+        // Theo cấu trúc đầu vào đã thống nhất, phần phiếu khám (không tính xét nghiệm)
+        // không vượt quá giới hạn này; tuyệt đối không cắt đôi một bệnh nhân ở mốc 15.
         for (const range of adultRanges) {
           if (range.end - range.start + 1 > BATCH_SIZE) {
             throw new Error(`Hồ sơ bắt đầu ở trang PDF ${allPdfPages[range.start].pageNumber} dài hơn 15 trang. Phiên bản này chưa chia một hồ sơ dài thành nhiều request; chưa gửi AI để tránh mất ngữ cảnh.`);
@@ -358,12 +403,19 @@ export default function OCRPage() {
           }
 
           batchNumber++;
-          setStatus(`🧠 OCR đã chia ranh giới. Đang gửi đợt ${batchNumber} — ${batchRanges.length} hồ sơ, ${batchPages.length}/15 trang khám cho M1 và M2 (không gửi phiếu xét nghiệm)...${batchNumber === 1 ? leadingPagesNotice + skippedIncompleteNotice : ""}`);
+          setStatus(`🧠 Đã xác định phạm vi phiếu khám. Đang gửi đợt ${batchNumber} — ${batchRanges.length} hồ sơ, ${batchPages.length}/15 trang khám cho M1 và M2 (không gửi xét nghiệm/phụ lục)...${batchNumber === 1 ? leadingPagesNotice + skippedIncompleteNotice : ""}`);
 
+          const batchStartedAt = Date.now();
           const [res1, res2] = await Promise.all([
             fetchWithRetry("MODEL_1", batchPages, 3, requestRanges),
             fetchWithRetry("MODEL_2", batchPages, 3, requestRanges)
           ]);
+          console.info("[KSK Performance] Dual AI batch completed", {
+            batch: batchNumber,
+            patients: batchRanges.length,
+            pages: batchPages.length,
+            wallTimeMs: Date.now() - batchStartedAt
+          });
 
           const attachAuthoritativeRanges = (patients: any[], model: string) => {
             const mapped = new Map<number, any>();
@@ -403,10 +455,16 @@ export default function OCRPage() {
           const currentBatch = Math.floor(offset / BATCH_SIZE) + 1;
           setStatus(`🧠 Đang gửi AI xử lý đợt ${currentBatch}/${totalBatches}...`);
           const batchPages = allPdfPages.slice(offset, offset + BATCH_SIZE);
+          const batchStartedAt = Date.now();
           const [res1, res2] = await Promise.all([
             fetchWithRetry("MODEL_1", batchPages, 3),
             fetchWithRetry("MODEL_2", batchPages, 3)
           ]);
+          console.info("[KSK Performance] Dual AI batch completed", {
+            batch: currentBatch,
+            pages: batchPages.length,
+            wallTimeMs: Date.now() - batchStartedAt
+          });
           const adjustRanges = (patients: any[], model: string) => (Array.isArray(patients) ? patients : [])
             .map((p: any) => {
               const localStart = toValidPage(p.page_start, -1);
@@ -422,6 +480,7 @@ export default function OCRPage() {
 
       setStatus("🔄 Đang đối chiếu độc lập kết quả M1 và M2...");
 
+      const reconciliationStartedAt = Date.now();
       const normalize = (value: any) => String(value ?? "").normalize("NFC").trim().replace(/\s+/g, " ").toLocaleUpperCase("vi-VN");
       const getName = (p: any) => normalize(p.HO_TEN || p.ho_ten || p.Ho_Ten || p.fullName);
       const getDob = (p: any) => normalize(p.NGAY_SINH || p.dateOfBirth || p.ngay_sinh);
@@ -551,11 +610,22 @@ export default function OCRPage() {
         return patientReconciled as PatientData;
       });
 
+      const reconciliationMs = Date.now() - reconciliationStartedAt;
       setReconciledData(allReconciledData);
       setPatientIndex(0);
       setGlobalImageIndex(0);
       const needsReview = allReconciledData.filter(p => p._groupingWarning).length;
-      setStatus(`🎉 Hoàn tất ${allReconciledData.length} hồ sơ. ${needsReview ? `Có ${needsReview} hồ sơ cần kiểm tra do thiếu kết quả từ một model.` : "M1 và M2 đã được đối chiếu theo đúng ranh giới OCR."}${skippedIncompleteNotice}`);
+      const aiRunTotalMs = Date.now() - aiRunStartedAt;
+      console.groupCollapsed("[KSK Performance] Dual AI and reconciliation");
+      console.table([
+        { stage: "AI + reconciliation total", durationMs: aiRunTotalMs },
+        { stage: "Full upload-to-result total", durationMs: uploadPreparationMsRef.current + aiRunTotalMs },
+        { stage: "Reconciliation/result preparation", durationMs: reconciliationMs },
+        { stage: "Patients displayed", durationMs: allReconciledData.length }
+      ]);
+      console.groupEnd();
+      const fullPipelineMs = uploadPreparationMsRef.current + aiRunTotalMs;
+      setStatus(`🎉 Hoàn tất ${allReconciledData.length} hồ sơ. AI: ${(aiRunTotalMs / 1000).toFixed(1)} giây; từ lúc tải PDF đến kết quả: ${(fullPipelineMs / 1000).toFixed(1)} giây. ${needsReview ? `Có ${needsReview} hồ sơ cần kiểm tra do thiếu kết quả từ một model.` : "M1 và M2 đã được đối chiếu theo đúng ranh giới OCR."}${skippedIncompleteNotice}`);
     } catch (error: any) {
       console.error(error);
       setStatus("❌ Lỗi: " + error.message);
