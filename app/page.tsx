@@ -640,7 +640,7 @@ export default function OCRPage() {
 
         // Copy đúng A:D và Y:CY sang workbook mới. Cách này loại bỏ hẳn E:X
         // mà không phải splice cột, tránh làm xê dịch merge/range trong file mẫu.
-        const sourceColumns = [1, 2, 3, 4, ...Array.from({ length: 79 }, (_, index) => 25 + index)];
+        const sourceColumns = [1, 2, 3, 4,5, ...Array.from({ length: 79 }, (_, index) => 25 + index)];
         const columnCount = sourceColumns.length; // 83 cột sau khi bỏ E:X.
 
         worksheet.properties = { ...sourceWorksheet.properties };
@@ -679,8 +679,8 @@ export default function OCRPage() {
 
         // Mẫu có một ô tiêu đề được gộp theo chiều dọc ở CV1:CV2.
         // Sau khi bỏ E:X, cột CV chuyển thành CB; giữ nguyên merge tương ứng.
-        worksheet.mergeCells("CB1:CB2");
-        if (worksheet.pageSetup) worksheet.pageSetup.printArea = `A1:CE${requiredLastRow}`;
+        worksheet.mergeCells("CC1:CC2");
+        if (worksheet.pageSetup) worksheet.pageSetup.printArea = `A1:CF${requiredLastRow}`;
 
         const fieldKeyRow = worksheet.getRow(2);
         reconciledData.forEach((patient, patientIndex) => {
