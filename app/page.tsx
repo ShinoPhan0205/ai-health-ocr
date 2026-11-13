@@ -668,7 +668,6 @@ export default function OCRPage() {
           if (sourceRow.height) outputRow.height = sourceRow.height;
           outputRow.hidden = sourceRow.hidden;
           outputRow.outlineLevel = sourceRow.outlineLevel;
-          outputRow.collapsed = sourceRow.collapsed;
 
           sourceColumns.forEach((sourceCol, index) => {
             const sourceCell = sourceRow.getCell(sourceCol);
