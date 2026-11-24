@@ -276,174 +276,254 @@ export default function OCRPage() {
       let adultRanges: Array<{ id: number; start: number; end: number }> = [];
       let skippedIncompleteNotice = "";
 
-      if (docType === "ADULT_18") {
-        // PATIENT_START xác định đầu mỗi hồ sơ; patientEnd xác định trang kết luận
-        // cuối cùng. LAB_START chỉ còn là phương án dự phòng khi OCR không đọc được
-        // trang kết luận, không còn là điều kiện bắt buộc để hồ sơ được xử lý.
-        const starts = allPdfPages
-          .map((page, index) => page.documentMarker === "PATIENT_START" ? index : -1)
-          .filter(index => index >= 0);
-        const labs = allPdfPages
-          .map((page, index) => page.documentMarker === "LAB_START" ? index : -1)
-          .filter(index => index >= 0);
+      
+if (docType === "ADULT_18") {
+  const starts = allPdfPages
+    .map((page, index) =>
+      page.documentMarker === "PATIENT_START" ? index : -1
+    )
+    .filter(index => index >= 0);
 
-        if (starts.length === 0) {
-          throw new Error("OCR chưa nhận diện được tiêu đề giấy khám sức khỏe người từ đủ 18 tuổi. Vui lòng kiểm tra vùng đầu trang hoặc tải lại PDF.");
-        }
+  if (starts.length === 0) {
+    throw new Error(
+      "OCR chưa nhận diện được tiêu đề giấy khám sức khỏe người từ đủ 18 tuổi. Vui lòng kiểm tra vùng đầu trang hoặc tải lại PDF."
+    );
+  }
 
-        // Nếu PDF được cắt từ giữa một tập hồ sơ, bỏ qua phần đầu cho đến
-        // PATIENT_START đầu tiên. Không cố đoán hoặc ghép phần đầu đó vào bệnh nhân mới.
-        const leadingPagesNotice = starts[0] > 0
-          ? ` Đã tự động bỏ qua các trang đầu file trước trang PDF ${allPdfPages[starts[0]].pageNumber} vì chưa có dấu bắt đầu hồ sơ.`
-          : "";
+  const leadingPagesNotice = starts[0] > 0
+    ? ` Đã tự động bỏ qua các trang đầu file trước trang PDF ${allPdfPages[starts[0]].pageNumber} vì chưa có dấu bắt đầu hồ sơ.`
+    : "";
 
-        // Giữ nguyên id gốc của starts để segment_index M1/M2 luôn khớp nhau,
-        // kể cả khi một hồ sơ phải bỏ qua vì chưa tìm thấy trang kết luận đáng tin cậy.
-        const skippedIncompleteRanges: Array<{ id: number; start: number; reason: string }> = [];
-        const detectedRanges = starts.map((start, id) => {
-          const nextStart = starts[id + 1] ?? allPdfPages.length;
-          const labIndex = labs.find(index => index >= start && index < nextStart);
+  const skippedIncompleteRanges: Array<{
+    id: number;
+    start: number;
+    reason: string;
+  }> = [];
 
-          // Ưu tiên trang có cả dấu hiệu phân loại sức khỏe chung và kết luận/bác sĩ.
-          // Không nhận diện trang xét nghiệm là trang kết luận.
-          const patientEndIndex = allPdfPages.findIndex((page, index) =>
-            index >= start && index < nextStart &&
-            (labIndex === undefined || index < labIndex) &&
-            page.patientEnd === true
-          );
+  const detectedRanges = starts.map((start, id) => {
+    const nextStart = starts[id + 1] ?? allPdfPages.length;
 
-          let end = patientEndIndex;
-          if (end < 0 && labIndex !== undefined) {
-            // Tương thích với PDF cũ nếu OCR không nhận ra phần kết luận nhưng vẫn
-            // nhận ra tiêu đề phiếu xét nghiệm đứng ngay sau phiếu khám.
-            end = labIndex - 1;
-          }
+    // Hồ sơ trung gian: điểm kết thúc chính xác là trang ngay trước
+    // PATIENT_START tiếp theo. Không phụ thuộc OCR patientEnd.
+    if (id < starts.length - 1) {
+      return { id, start, end: nextStart - 1 };
+    }
 
-          if (end < start) {
-            skippedIncompleteRanges.push({
-              id,
-              start,
-              reason: labIndex === undefined
-                ? "không nhận diện được trang kết luận cuối cùng của bác sĩ"
-                : "không xác định được trang kết thúc trước phiếu xét nghiệm"
-            });
-            return null;
-          }
+    // Hồ sơ cuối file không có PATIENT_START kế tiếp nên vẫn cần
+    // kiểm tra bảo thủ bằng dấu hiệu trang kết luận.
+    const labIndex = allPdfPages.findIndex((page, index) =>
+      index >= start &&
+      index < nextStart &&
+      page.documentMarker === "LAB_START"
+    );
 
-          return { id, start, end };
+    let patientEndIndex = -1;
+
+    if (labIndex >= 0) {
+      patientEndIndex = allPdfPages.findIndex((page, index) =>
+        index > labIndex &&
+        index < nextStart &&
+        page.patientEnd === true
+      );
+    }
+
+    if (patientEndIndex < 0) {
+      patientEndIndex = allPdfPages.findIndex((page, index) =>
+        index >= start &&
+        index < nextStart &&
+        page.patientEnd === true
+      );
+    }
+
+    if (patientEndIndex < 0) {
+      skippedIncompleteRanges.push({
+        id,
+        start,
+        reason: labIndex >= 0
+          ? "hồ sơ cuối file chưa nhận diện được trang kết luận sau phiếu xét nghiệm"
+          : "hồ sơ cuối file chưa nhận diện được trang kết luận cuối cùng của bác sĩ"
+      });
+      return null;
+    }
+
+    return { id, start, end: patientEndIndex };
+  });
+
+  adultRanges = detectedRanges.filter(
+    (
+      range
+    ): range is { id: number; start: number; end: number } =>
+      range !== null
+  );
+
+  const skippedStartPages = skippedIncompleteRanges.map(
+    item => allPdfPages[item.start].pageNumber
+  );
+
+  skippedIncompleteNotice = skippedStartPages.length > 0
+    ? ` Đã bỏ qua ${skippedStartPages.length} hồ sơ cuối file chưa xác định chắc chắn được trang kết luận (bắt đầu tại trang PDF ${skippedStartPages.slice(0, 10).join(", ")}${skippedStartPages.length > 10 ? ` và ${skippedStartPages.length - 10} hồ sơ khác` : ""}).`
+    : "";
+
+  if (adultRanges.length === 0) {
+    const reasonDetails = skippedIncompleteRanges
+      .slice(0, 5)
+      .map(item =>
+        `trang PDF ${allPdfPages[item.start].pageNumber}: ${item.reason}`
+      )
+      .join("; ");
+
+    throw new Error(
+      `Không xác định được phạm vi phiếu khám nào đủ tin cậy để gửi AI. Các hồ sơ trước hồ sơ cuối đã được phân ranh giới bằng PATIENT_START kế tiếp; hồ sơ cuối cần có dấu hiệu kết luận để tránh gửi một hồ sơ bị cắt cụt.${reasonDetails ? ` Chi tiết: ${reasonDetails}.` : " Vui lòng kiểm tra lại PDF."}`
+    );
+  }
+
+  /*
+   * Tạo danh sách trang thực sự gửi Gemini.
+   * Các trang có isLabPage=true sẽ bị loại.
+   * Trang kết luận sau xét nghiệm vẫn được giữ lại.
+   */
+  const getPatientAiPages = (range: {
+    id: number;
+    start: number;
+    end: number;
+  }): ValidPage[] => {
+    return allPdfPages
+      .slice(range.start, range.end + 1)
+      .filter(page => page.isLabPage !== true);
+  };
+
+  // Không cắt đôi một bệnh nhân ở giới hạn 15 trang.
+  for (const range of adultRanges) {
+    const aiPages = getPatientAiPages(range);
+
+    if (aiPages.length === 0) {
+      throw new Error(
+        `Hồ sơ bắt đầu ở trang PDF ${allPdfPages[range.start].pageNumber} không còn trang khám hợp lệ sau khi loại phiếu xét nghiệm.`
+      );
+    }
+
+    if (aiPages.length > BATCH_SIZE) {
+      throw new Error(
+        `Hồ sơ bắt đầu ở trang PDF ${allPdfPages[range.start].pageNumber} có ${aiPages.length} trang khám cần gửi AI, vượt giới hạn ${BATCH_SIZE} trang. Chưa gửi AI để tránh mất ngữ cảnh.`
+      );
+    }
+  }
+
+  let cursor = 0;
+  let batchNumber = 0;
+
+  while (cursor < adultRanges.length) {
+    let lastRangeIndex = cursor;
+    let pageCount = 0;
+
+    while (lastRangeIndex < adultRanges.length) {
+      const candidate = adultRanges[lastRangeIndex];
+      const candidateLength = getPatientAiPages(candidate).length;
+
+      if (pageCount + candidateLength > BATCH_SIZE) break;
+
+      pageCount += candidateLength;
+      lastRangeIndex++;
+    }
+
+    // Luôn có ít nhất một bệnh nhân trong batch vì đã kiểm tra
+    // số trang từng bệnh nhân không vượt quá BATCH_SIZE.
+    if (lastRangeIndex === cursor) {
+      throw new Error("Không thể tạo lô gửi AI hợp lệ.");
+    }
+
+    const batchRanges = adultRanges.slice(cursor, lastRangeIndex);
+
+    const batchPages: ValidPage[] = [];
+
+    const requestRanges = batchRanges.map(range => {
+      const patientPages = getPatientAiPages(range);
+
+      const localStart = batchPages.length;
+      batchPages.push(...patientPages);
+
+      return {
+        segment_index: range.id,
+        page_start: localStart,
+        page_end: localStart + patientPages.length - 1
+      };
+    });
+
+    if (batchPages.length === 0 || batchPages.length > BATCH_SIZE) {
+      throw new Error(
+        "Lô gửi AI không hợp lệ sau khi loại các trang phiếu xét nghiệm."
+      );
+    }
+
+    batchNumber++;
+
+    setStatus(
+      `🧠 Đang gửi đợt ${batchNumber} — ${batchRanges.length} hồ sơ, ${batchPages.length}/15 trang khám cho M1 và M2 (đã loại trang xét nghiệm)...${batchNumber === 1 ? leadingPagesNotice + skippedIncompleteNotice : ""}`
+    );
+
+    const batchStartedAt = Date.now();
+
+    // Hai model nhận chính xác cùng một danh sách ảnh.
+    // Không dùng kết quả model này để thay thế model còn lại.
+    const [res1, res2] = await Promise.all([
+      fetchWithRetry("MODEL_1", batchPages, 3, requestRanges),
+      fetchWithRetry("MODEL_2", batchPages, 3, requestRanges)
+    ]);
+
+    console.info("[KSK Performance] Dual AI batch completed", {
+      batch: batchNumber,
+      patients: batchRanges.length,
+      pages: batchPages.length,
+      wallTimeMs: Date.now() - batchStartedAt
+    });
+
+    const attachAuthoritativeRanges = (
+      patients: any[],
+      model: string
+    ) => {
+      const mapped = new Map<number, any>();
+
+      (Array.isArray(patients) ? patients : []).forEach(patient => {
+        const segmentId = Number(patient.segment_index);
+
+        const range = adultRanges.find(
+          item => item.id === segmentId
+        );
+
+        if (!range || mapped.has(segmentId)) return;
+
+        mapped.set(segmentId, {
+          ...patient,
+          page_start: range.start,
+          page_end: range.end,
+          _sourceModel: model,
+          _segmentIndex: segmentId
         });
-        adultRanges = detectedRanges.filter(
-          (range): range is { id: number; start: number; end: number } => range !== null
-        );
+      });
 
-        const skippedStartPages = skippedIncompleteRanges.map(
-          item => allPdfPages[item.start].pageNumber
-        );
-        skippedIncompleteNotice = skippedStartPages.length > 0
-          ? ` Đã bỏ qua ${skippedStartPages.length} hồ sơ chưa xác định chắc chắn được trang kết luận (bắt đầu tại trang PDF ${skippedStartPages.slice(0, 10).join(", ")}${skippedStartPages.length > 10 ? ` và ${skippedStartPages.length - 10} hồ sơ khác` : ""}); các hồ sơ này không được gửi AI để tránh lấy nhầm trang xét nghiệm/phụ lục.`
-          : "";
+      return mapped;
+    };
 
-        // Nếu không còn hồ sơ hợp lệ thì dừng trước khi gọi API, nhưng không
-        // biến hồ sơ thiếu thành dữ liệu suy đoán.
-        if (adultRanges.length === 0) {
-          const reasonDetails = skippedIncompleteRanges.slice(0, 5).map(item =>
-            `trang PDF ${allPdfPages[item.start].pageNumber}: ${item.reason}`
-          ).join("; ");
-          throw new Error(
-            `Không xác định được phạm vi phiếu khám nào đủ tin cậy để gửi AI.${reasonDetails ? ` Chi tiết: ${reasonDetails}.` : " Vui lòng kiểm tra lại PDF."}`
-          );
-        }
+    const mappedM1 = attachAuthoritativeRanges(
+      res1.patients,
+      "M1"
+    );
 
-        // Chỉ đưa các trang từ đầu phiếu khám đến trang kết luận cuối cùng vào Gemini.
-        // Phiếu xét nghiệm và phụ lục phía sau vẫn được giữ trong allPdfPages để xem ảnh gốc.
+    const mappedM2 = attachAuthoritativeRanges(
+      res2.patients,
+      "M2"
+    );
 
-        // Mỗi hồ sơ khám được gửi nguyên vẹn trong một request tối đa 15 trang.
-        // Theo cấu trúc đầu vào đã thống nhất, phần phiếu khám (không tính xét nghiệm)
-        // không vượt quá giới hạn này; tuyệt đối không cắt đôi một bệnh nhân ở mốc 15.
-        for (const range of adultRanges) {
-          if (range.end - range.start + 1 > BATCH_SIZE) {
-            throw new Error(`Hồ sơ bắt đầu ở trang PDF ${allPdfPages[range.start].pageNumber} dài hơn 15 trang. Phiên bản này chưa chia một hồ sơ dài thành nhiều request; chưa gửi AI để tránh mất ngữ cảnh.`);
-          }
-        }
+    for (const range of batchRanges) {
+      const p1 = mappedM1.get(range.id);
+      const p2 = mappedM2.get(range.id);
 
-        // Gom nhiều hồ sơ theo thứ tự vào cùng request nhưng tuyệt đối không cắt giữa hồ sơ.
-        // Các trang phiếu xét nghiệm nằm giữa các hồ sơ sẽ được bỏ qua khỏi request.
-        let cursor = 0;
-        let batchNumber = 0;
-        while (cursor < adultRanges.length) {
-          let lastRangeIndex = cursor;
-          let pageCount = 0;
-          while (lastRangeIndex < adultRanges.length) {
-            const candidate = adultRanges[lastRangeIndex];
-            const candidateLength = candidate.end - candidate.start + 1;
-            if (pageCount + candidateLength > BATCH_SIZE) break;
-            pageCount += candidateLength;
-            lastRangeIndex++;
-          }
+      if (p1) allM1Patients.push(p1);
+      if (p2) allM2Patients.push(p2);
+    }
 
-          const batchRanges = adultRanges.slice(cursor, lastRangeIndex);
-
-          // Nén các trang khám của từng bệnh nhân thành một request liên tục.
-          // Khoảng trống giữa các bệnh nhân chính là trang xét nghiệm lưu trữ,
-          // vì vậy tuyệt đối không đưa các trang đó vào batchPages.
-          const batchPages: ValidPage[] = [];
-          const requestRanges = batchRanges.map(range => {
-            const patientPages = allPdfPages.slice(range.start, range.end + 1);
-            const localStart = batchPages.length;
-            batchPages.push(...patientPages);
-            return {
-              segment_index: range.id,
-              page_start: localStart,
-              page_end: localStart + patientPages.length - 1
-            };
-          });
-
-          if (batchPages.length === 0 || batchPages.length > BATCH_SIZE) {
-            throw new Error("Lô gửi AI không hợp lệ sau khi loại các trang phiếu xét nghiệm lưu trữ.");
-          }
-
-          batchNumber++;
-          setStatus(`🧠 Đã xác định phạm vi phiếu khám. Đang gửi đợt ${batchNumber} — ${batchRanges.length} hồ sơ, ${batchPages.length}/15 trang khám cho M1 và M2 (không gửi xét nghiệm/phụ lục)...${batchNumber === 1 ? leadingPagesNotice + skippedIncompleteNotice : ""}`);
-
-          const batchStartedAt = Date.now();
-          const [res1, res2] = await Promise.all([
-            fetchWithRetry("MODEL_1", batchPages, 3, requestRanges),
-            fetchWithRetry("MODEL_2", batchPages, 3, requestRanges)
-          ]);
-          console.info("[KSK Performance] Dual AI batch completed", {
-            batch: batchNumber,
-            patients: batchRanges.length,
-            pages: batchPages.length,
-            wallTimeMs: Date.now() - batchStartedAt
-          });
-
-          const attachAuthoritativeRanges = (patients: any[], model: string) => {
-            const mapped = new Map<number, any>();
-            (Array.isArray(patients) ? patients : []).forEach(patient => {
-              const segmentId = Number(patient.segment_index);
-              const range = adultRanges.find(item => item.id === segmentId);
-              if (!range || mapped.has(segmentId)) return;
-              mapped.set(segmentId, {
-                ...patient,
-                page_start: range.start,
-                page_end: range.end,
-                _sourceModel: model,
-                _segmentIndex: segmentId
-              });
-            });
-            return mapped;
-          };
-
-          const mappedM1 = attachAuthoritativeRanges(res1.patients, "M1");
-          const mappedM2 = attachAuthoritativeRanges(res2.patients, "M2");
-          for (const range of batchRanges) {
-            const p1 = mappedM1.get(range.id);
-            const p2 = mappedM2.get(range.id);
-            if (p1) allM1Patients.push(p1);
-            if (p2) allM2Patients.push(p2);
-          }
-          cursor = lastRangeIndex;
-        }
+    cursor = lastRangeIndex;
+  }
       } else {
         // Giữ nguyên luồng chia lô AI cũ cho loại hồ sơ học sinh.
         const totalBatches = Math.ceil(allPdfPages.length / BATCH_SIZE);
@@ -663,10 +743,27 @@ export default function OCRPage() {
 
   // --- 6. CÁC HÀM TIỆN ÍCH KHÁC ---
   function handleFieldChange(key: string, newValue: string) {
-    const updated = [...reconciledData];
-    updated[patientIndex][key].final = newValue;
-    updated[patientIndex][key].status = "AGREED";
-    setReconciledData(updated);
+    setReconciledData(previous =>
+      previous.map((patient, index) => {
+        if (index !== patientIndex) return patient;
+
+        const currentField = patient[key] || {
+          m1: "",
+          m2: "",
+          final: "",
+          status: "DISAGREED" as const
+        };
+
+        return {
+          ...patient,
+          [key]: {
+            ...currentField,
+            final: newValue,
+            status: "AGREED" as const
+          }
+        };
+      })
+    );
   }
 
   const totalConflicts = useMemo(() => {
@@ -710,7 +807,10 @@ export default function OCRPage() {
 
         // Copy đúng A:D và Y:CY sang workbook mới. Cách này loại bỏ hẳn E:X
         // mà không phải splice cột, tránh làm xê dịch merge/range trong file mẫu.
-        const sourceColumns = [1, 2, 3, 4,5, ...Array.from({ length: 79 }, (_, index) => 25 + index)];
+        const sourceColumns = [
+  1, 2, 3, 4,
+  ...Array.from({ length: 79 }, (_, index) => 25 + index)
+];
         const columnCount = sourceColumns.length; // 83 cột sau khi bỏ E:X.
 
         worksheet.properties = { ...sourceWorksheet.properties };
@@ -749,8 +849,10 @@ export default function OCRPage() {
 
         // Mẫu có một ô tiêu đề được gộp theo chiều dọc ở CV1:CV2.
         // Sau khi bỏ E:X, cột CV chuyển thành CB; giữ nguyên merge tương ứng.
-        worksheet.mergeCells("CC1:CC2");
-        if (worksheet.pageSetup) worksheet.pageSetup.printArea = `A1:CF${requiredLastRow}`;
+        worksheet.mergeCells("CB1:CB2");
+if (worksheet.pageSetup) {
+  worksheet.pageSetup.printArea = `A1:CE${requiredLastRow}`;
+}
 
         const fieldKeyRow = worksheet.getRow(2);
         reconciledData.forEach((patient, patientIndex) => {

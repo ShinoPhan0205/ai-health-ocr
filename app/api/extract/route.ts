@@ -126,7 +126,7 @@ YÊU CẦU TRÍCH XUẤT VÀ ĐỌC KHÁM LÂM SÀNG:
 2. segment_index phải được sao chép nguyên vẹn; page_start/page_end phải giữ đúng khoảng OCR cung cấp.
 3. Chỉ đọc trang thuộc đúng segment. Không lấy dữ liệu của bệnh nhân khác.
 4. Hai model hoạt động độc lập, tự đọc ảnh gốc; không giả định hoặc sao chép kết quả của model còn lại.
-5. Đọc lần lượt TẤT CẢ các trang trong segment. Frontend đã giới hạn segment từ trang đầu phiếu khám đến trang có kết luận cuối cùng của bác sĩ; không yêu cầu phải có phiếu xét nghiệm và không tự kéo dài phạm vi sang phiếu xét nghiệm/phụ lục. Không bỏ qua phần khám lâm sàng, dấu mộc, chữ viết tay, dấu tick, số phân loại hoặc kết luận nằm ở cuối trang.
+5. Đọc lần lượt TẤT CẢ các ảnh được cung cấp trong segment. Ranh giới segment đã được frontend xác định: với hồ sơ ở giữa file, segment kết thúc ngay trước PATIENT_START của bệnh nhân kế tiếp; với hồ sơ cuối file, frontend dùng dấu hiệu trang kết luận để kiểm tra tính đầy đủ. Các trang có tiêu đề phiếu kết quả xét nghiệm đã được frontend loại riêng; không tự chia lại hoặc kéo dài ranh giới. Không bỏ qua phần khám lâm sàng, dấu mộc, chữ viết tay, dấu tick, số phân loại hoặc kết luận ở bất kỳ trang nào được cung cấp.
 6. Không để trống trường nếu trên ảnh có nội dung đọc được. Nếu thực sự không có nội dung hoặc không thể đọc sau khi đã xem kỹ thì mới trả chuỗi rỗng. Không tự bịa dữ liệu.
 7. Không dùng họ tên làm căn cứ thay đổi ranh giới.
 8. Đọc đầy đủ các câu hỏi tiền sử gia đình và tiền sử bản thân TSGD_* và TSBT_*. Với Có/Không, đọc dấu đánh dấu thực tế. Nếu biểu mẫu quy định mặc định là Không và không có dấu xác nhận Có thì dùng Không; nếu không xác định được dấu thì để trống.
@@ -137,6 +137,27 @@ YÊU CẦU TRÍCH XUẤT VÀ ĐỌC KHÁM LÂM SÀNG:
 13. Khi chuẩn hóa chữ viết tắt, phải giữ nguyên ý nghĩa lâm sàng, vị trí giải phẫu, bên trái/phải và mã răng. Chỉ khai triển khi ngữ cảnh đủ rõ; không tự suy diễn chẩn đoán hoặc thêm bệnh không có trên ảnh.
 14. Bốn trường thính lực TAI_TRAI_NOI_THUONG, TAI_PHAI_NOI_THUONG, TAI_TRAI_NOI_THAM, TAI_PHAI_NOI_THAM sẽ do hệ thống áp dụng mặc định sau trích xuất; không tự suy đoán các giá trị này từ số OCR nhầm.
 15. Chỉ điền MA_CSKCB, MA_GTIN_CSKCB, NGAY_VAO khi đọc được từ hồ sơ.
+16. NHẬN DIỆN NÉT GẠCH CHÉO VÀ DẤU ĐÁNH DẤU BÌNH THƯỜNG (BT) - BẮT BUỘC ĐỌC BẰNG HÌNH ẢNH:
+
+- Không chỉ đọc chữ viết tay theo từng dòng riêng lẻ. Phải quan sát toàn bộ bố cục biểu mẫu, các đường kẻ, nét bút và dấu đánh dấu của bác sĩ.
+
+- Đặc biệt chú ý các nét gạch chéo dài, nét thẳng hoặc nét bút liên tục chạy xuyên qua nhiều dòng khám chuyên khoa. Đây có thể là cách bác sĩ đánh dấu một nhóm mục khám bình thường mà không cần ghi nội dung riêng vào từng dòng.
+
+- Khi phát hiện nét gạch chéo đi kèm chữ viết tắt "BT" (Bình thường), dấu mộc "HIỆN TẠI CHƯA PHÁT HIỆN BẤT THƯỜNG" hoặc dấu xác nhận bình thường khác, phải kiểm tra mối liên hệ giữa dấu đó và toàn bộ các dòng nằm trong phạm vi được đánh dấu.
+
+- Nếu xác định nét gạch và dấu BT dùng để xác nhận bình thường cho nhiều dòng, phải áp dụng kết quả cho TẤT CẢ các mục khám thuộc phạm vi xác nhận, không chỉ dòng có chữ BT hoặc dòng có dấu mộc.
+
+- Với từng mục được xác nhận bình thường:
+  + Trường kết quả: "Hiện tại chưa phát hiện bất thường".
+  + Trường phân loại tương ứng: "1".
+
+- Phải đối chiếu vị trí thực tế của nét bút với từng dòng và từng chuyên khoa. Không được bỏ sót các dòng nằm trong phạm vi đánh dấu chỉ vì chúng không có chữ viết tay riêng.
+
+- ƯU TIÊN PHÁT HIỆN BẤT THƯỜNG CỤ THỂ: Nếu một dòng có nội dung bất thường riêng do bác sĩ ghi, ví dụ "hen suyễn" ở mục Hô hấp, phải giữ nguyên nội dung bất thường và phân loại thực tế của dòng đó. Không được ghi đè thành bình thường chỉ vì có nét gạch chéo đi qua khu vực này.
+
+- Không mặc định mọi nét gạch chéo đều mang ý nghĩa bình thường. Chỉ áp dụng khi có đủ bằng chứng về hình dạng nét bút, phạm vi đánh dấu và dấu hiệu xác nhận BT.
+
+- Nếu không xác định chắc chắn nét gạch áp dụng cho dòng nào, không tự suy diễn. Để trống thông tin chưa xác định để người dùng kiểm tra.
 Chỉ trả về JSON theo schema, không kèm giải thích.`
         : `Bạn là chuyên gia đọc hồ sơ khám sức khỏe người lớn từ ảnh scan.
 NHIỆM VỤ: đọc các ảnh trong lô và nhóm các trang thuộc cùng một bệnh nhân, sau đó trích xuất thông tin.
@@ -290,7 +311,56 @@ QUY TẮC: page_start/page_end là chỉ số ảnh trong lô từ 0; không dù
     const rawPatients = JSON.parse(cleanJsonText);
 
     if (!Array.isArray(rawPatients)) throw new Error("AI trả về dữ liệu không phải mảng hồ sơ.");
+    const diagnosePatients = (patients: any[]) => {
+  return patients.map((p: any) => ({
+    segment_index: p?.segment_index ?? null,
 
+    // Chỉ đếm số trường có dữ liệu, không in nội dung y tế
+    nonEmptyFields: Object.entries(p || {}).filter(([key, value]) =>
+      !["segment_index", "page_start", "page_end"].includes(key) &&
+      value !== null &&
+      value !== undefined &&
+      String(value).trim() !== ""
+    ).length,
+
+    returnedKeys: Object.keys(p || {})
+  }));
+};
+
+console.log(
+  "[KSK Diagnostic] Gemini raw response",
+  JSON.stringify(
+    {
+      modelId,
+      expectedSegments: patientRanges?.map(
+        (r: any) => r.segment_index
+      ),
+      rawPatientCount: rawPatients.length,
+      records: rawPatients.map((patient: any) => ({
+        segment_index: patient.segment_index,
+        nonEmptyFields: Object.entries(patient)
+          .filter(([key, value]) => {
+            if (
+              key === "segment_index" ||
+              key === "page_start" ||
+              key === "page_end"
+            ) {
+              return false;
+            }
+
+            return (
+              value !== null &&
+              value !== undefined &&
+              String(value).trim() !== ""
+            );
+          })
+          .map(([key]) => key),
+      })),
+    },
+    null,
+    2
+  )
+);
     // Kiểm tra và giới hạn khoảng trang theo đúng kích thước lô.
     const validatedPatients = rawPatients.flatMap((patient: any) => {
       if (docType === "ADULT_18" && Array.isArray(patientRanges)) {
@@ -310,6 +380,14 @@ QUY TẮC: page_start/page_end là chỉ số ảnh trong lô từ 0; không dù
       return [{ ...patient, page_start: start, page_end: Math.min(end, pages.length - 1) }];
     });
 
+    console.log("[KSK Diagnostic] After validation", {
+  modelId,
+  rawCount: rawPatients.length,
+  validatedCount: validatedPatients.length,
+  validatedSegments: validatedPatients.map(
+    (p: any) => p.segment_index
+  )
+});
     let cleanedPatients = validatedPatients;
     parseResultMs = Date.now() - parseStartedAt;
 
