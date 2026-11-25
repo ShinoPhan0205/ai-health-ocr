@@ -86,24 +86,57 @@ function normalizeOcrText(value: string): string {
 
 function classifyHeader(text: string): DocumentMarker {
   const normalized = normalizeOcrText(text);
+  const words = normalized.split(" ").filter(Boolean);
 
-  const hasHealthTitle = normalized.includes("GIAY KHAM SUC KHOE");
+  // OCR đầu trang đôi khi đọc sai/mất một vài ký tự hoặc ngắt cụm từ.
+  // Dùng so khớp gần đúng cho các từ tiêu đề, nhưng vẫn yêu cầu đủ cụm
+  // "GIAY KHAM" + "SUC KHOE" + dấu hiệu biểu mẫu người từ đủ 18 tuổi.
+  const editDistance = (a: string, b: string): number => {
+    const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      let previous = row[0];
+      row[0] = i;
+      for (let j = 1; j <= b.length; j++) {
+        const old = row[j];
+        row[j] = Math.min(
+          row[j] + 1,
+          row[j - 1] + 1,
+          previous + (a[i - 1] === b[j - 1] ? 0 : 1)
+        );
+        previous = old;
+      }
+    }
+    return row[b.length];
+  };
+
+  const hasApproxWord = (target: string, maxDistance = 1): boolean =>
+    words.some(word =>
+      word.length >= target.length - maxDistance &&
+      word.length <= target.length + maxDistance &&
+      editDistance(word, target) <= maxDistance
+    );
+
+  const hasHealthTitle =
+    normalized.includes("GIAY KHAM SUC KHOE") ||
+    (hasApproxWord("GIAY") && hasApproxWord("KHAM") &&
+      hasApproxWord("SUC") && hasApproxWord("KHOE"));
+
   const hasAdultPhrase =
     normalized.includes("DINH KY") ||
     normalized.includes("TU DU 18 TUOI") ||
-    normalized.includes("NGUOI TU DU 18");
+    normalized.includes("NGUOI TU DU 18") ||
+    (hasApproxWord("DINH") && hasApproxWord("KY")) ||
+    (hasApproxWord("NGUOI") && hasApproxWord("TU") &&
+      hasApproxWord("DU") && words.some(word => word === "18" || word === "I8"));
 
-  if (hasHealthTitle && hasAdultPhrase) {
-    return "PATIENT_START";
-  }
+  if (hasHealthTitle && hasAdultPhrase) return "PATIENT_START";
 
-  if (
+  const hasLabTitle =
     normalized.includes("PHIEU KET QUA XET NGHIEM") ||
-    (normalized.includes("PHIEU") && normalized.includes("KET QUA XET NGHIEM"))
-  ) {
-    return "LAB_START";
-  }
+    (hasApproxWord("PHIEU") && hasApproxWord("KET") &&
+      hasApproxWord("QUA") && hasApproxWord("XET") && hasApproxWord("NGHIEM"));
 
+  if (hasLabTitle) return "LAB_START";
   return null;
 }
 
@@ -301,7 +334,7 @@ function getPatientSegments(pages: ValidPage[]): PatientPageSegment[] {
  * - OCR đầu trang để tìm PATIENT_START và LAB_START.
  * - Chỉ OCR chân trang hồ sơ cuối, quét ngược đến khi tìm thấy patientEnd.
  * - Các hồ sơ trước kết thúc tại PATIENT_START kế tiếp, không cần OCR footer.
- * - LAB_START được giữ làm dấu mốc để loại trang tiêu đề xét nghiệm.
+ * - LAB_START đánh dấu phần phụ lục; toàn bộ trang từ đó đến hồ sơ kế tiếp bị loại.
  *
  * Không giả định số trang cố định cho mỗi bệnh nhân.
  */
@@ -599,58 +632,48 @@ export async function extractAndFilterPages(
      * - Các hồ sơ trước: điểm kết thúc chính là trang ngay trước PATIENT_START
      *   kế tiếp, vì vậy không cần OCR footer các trang này.
      * - Chỉ hồ sơ cuối cùng không có PATIENT_START kế tiếp nên cần tìm patientEnd.
+     * - Các hồ sơ trước kết thúc tại PATIENT_START kế tiếp; phần sau LAB_START bị loại.
      * - Quét hồ sơ cuối từ cuối PDF trở ngược và dừng ngay khi tìm thấy patientEnd.
      *
-     * LAB_START vẫn được giữ làm dấu mốc. Với các hồ sơ trước, chỉ trang có
-     * tiêu đề LAB_START được đánh dấu chắc chắn là trang xét nghiệm; không OCR
-     * footer hàng loạt để suy đoán các trang tiếp theo.
+     * LAB_START là ranh giới giữa phiếu khám cần trích xuất và phần phụ lục.
+     * Toàn bộ trang từ LAB_START đến trước PATIENT_START tiếp theo được loại.
      */
     const patientSegments = getPatientSegments(validPages);
     const finalSegment = patientSegments.length > 0
       ? patientSegments[patientSegments.length - 1]
       : undefined;
 
-    // Ghi nhận vùng có thể là xét nghiệm trong từng hồ sơ.
-    // Việc nhận diện bổ sung ở đây chỉ dùng headerText đã OCR sẵn ở lượt 1,
-    // không render lại trang và không phát sinh thêm lượt OCR.
+    // Theo yêu cầu nghiệp vụ: chỉ lấy phiếu khám sức khỏe đầu tiên đến
+    // phần kết luận. Khi đã gặp LAB_START, toàn bộ phần còn lại của hồ sơ
+    // là phụ lục/xét nghiệm đính kèm, không gửi Gemini (kể cả xét nghiệm
+    // nối tiếp không lặp tiêu đề, siêu âm hoặc trang lưu trữ đi kèm).
+    // PATIENT_START kế tiếp sẽ mở hồ sơ mới và kết thúc vùng loại bỏ này.
     for (const segment of patientSegments) {
       if (segment.labStart === undefined) continue;
-
-      for (
-        let index = segment.labStart;
-        index <= segment.end;
-        index++
-      ) {
-        const page = validPages[index];
-
-        if (
-          page.documentMarker === "LAB_START" ||
-          classifyLabContent("", page.headerText || "")
-        ) {
-          page.isLabPage = true;
-        }
+      for (let index = segment.labStart; index <= segment.end; index++) {
+        validPages[index].isLabPage = true;
       }
     }
 
-    const finalLabCandidatePageNumbers = new Set<number>();
-
-    if (finalSegment?.labStart !== undefined) {
-      for (
-        let index = finalSegment.labStart;
-        index <= finalSegment.end;
-        index++
-      ) {
-        finalLabCandidatePageNumbers.add(validPages[index].pageNumber);
-      }
-    }
-
-    // Các trang nối tiếp LAB_START được phân loại bằng header OCR sẵn có.
-    // Riêng hồ sơ cuối, footer OCR bên dưới có thể bổ sung nhận diện chính xác hơn.
+    // Bảo đảm mọi trang có marker LAB_START đều bị loại, kể cả trường hợp
+    // marker xuất hiện ở trang đầu của một segment hoặc OCR segment bất thường.
     for (const page of validPages) {
-      if (page.documentMarker === "LAB_START") {
-        page.isLabPage = true;
-      }
+      if (page.documentMarker === "LAB_START") page.isLabPage = true;
     }
+
+    const excludedAttachmentRanges = patientSegments
+      .filter(segment => segment.labStart !== undefined)
+      .map(segment => ({
+        startPage: validPages[segment.labStart!].pageNumber,
+        endPage: validPages[segment.end].pageNumber
+      }));
+
+    console.info("[KSK Segmentation]", {
+      patientStartPages: validPages
+        .filter(page => page.documentMarker === "PATIENT_START")
+        .map(page => page.pageNumber),
+      excludedAttachmentRanges
+    });
 
     const footerTargetPages: ValidPage[] = finalSegment
       ? validPages
@@ -753,19 +776,7 @@ export async function extractAndFilterPages(
           const footerText = footerResult?.data?.text || "";
           const headerText = validPage.headerText || "";
 
-          validPage.patientEnd = classifyPatientEnd(
-            footerText,
-            headerText
-          );
-
-          // Với hồ sơ cuối, phân loại thêm các trang sau LAB_START mà
-          // thực tế đã được OCR. Các hồ sơ trước không phải OCR footer.
-          validPage.isLabPage =
-            validPage.documentMarker === "LAB_START" ||
-            (
-              finalLabCandidatePageNumbers.has(validPage.pageNumber) &&
-              classifyLabContent(footerText, headerText)
-            );
+          validPage.patientEnd = classifyPatientEnd(footerText, headerText);
 
           console.debug("[KSK Final Patient Detection]", {
             page: validPage.pageNumber,
