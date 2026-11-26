@@ -85,58 +85,58 @@ function normalizeOcrText(value: string): string {
 }
 
 function classifyHeader(text: string): DocumentMarker {
+  // Chuẩn hóa TOÀN BỘ văn bản OCR trước khi phân loại:
+  // bỏ dấu tiếng Việt, dấu câu/ký tự đặc biệt, chuyển thành chữ hoa,
+  // rồi chỉ làm việc với danh sách từ đã được tách bằng khoảng trắng.
   const normalized = normalizeOcrText(text);
-  const words = normalized.split(" ").filter(Boolean);
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const wordSet = new Set(words);
 
-  // OCR đầu trang đôi khi đọc sai/mất một vài ký tự hoặc ngắt cụm từ.
-  // Dùng so khớp gần đúng cho các từ tiêu đề, nhưng vẫn yêu cầu đủ cụm
-  // "GIAY KHAM" + "SUC KHOE" + dấu hiệu biểu mẫu người từ đủ 18 tuổi.
-  const editDistance = (a: string, b: string): number => {
-    const row = Array.from({ length: b.length + 1 }, (_, i) => i);
-    for (let i = 1; i <= a.length; i++) {
-      let previous = row[0];
-      row[0] = i;
-      for (let j = 1; j <= b.length; j++) {
-        const old = row[j];
-        row[j] = Math.min(
-          row[j] + 1,
-          row[j - 1] + 1,
-          previous + (a[i - 1] === b[j - 1] ? 0 : 1)
-        );
-        previous = old;
-      }
-    }
-    return row[b.length];
-  };
+  // Chỉ dùng khớp từ nguyên vẹn sau chuẩn hóa. Không so khớp nguyên câu,
+  // vì dấu câu, xuống dòng và dấu tiếng Việt không còn ảnh hưởng ở bước này.
+  const hasAllWords = (tokens: string[]) =>
+    tokens.every(token => wordSet.has(token));
+  const countWords = (tokens: string[]) =>
+    tokens.filter(token => wordSet.has(token)).length;
 
-  const hasApproxWord = (target: string, maxDistance = 1): boolean =>
-    words.some(word =>
-      word.length >= target.length - maxDistance &&
-      word.length <= target.length + maxDistance &&
-      editDistance(word, target) <= maxDistance
-    );
-
-  const hasHealthTitle =
-    normalized.includes("GIAY KHAM SUC KHOE") ||
-    (hasApproxWord("GIAY") && hasApproxWord("KHAM") &&
-      hasApproxWord("SUC") && hasApproxWord("KHOE"));
-
-  const hasAdultPhrase =
-    normalized.includes("DINH KY") ||
-    normalized.includes("TU DU 18 TUOI") ||
-    normalized.includes("NGUOI TU DU 18") ||
-    (hasApproxWord("DINH") && hasApproxWord("KY")) ||
-    (hasApproxWord("NGUOI") && hasApproxWord("TU") &&
-      hasApproxWord("DU") && words.some(word => word === "18" || word === "I8"));
-
-  if (hasHealthTitle && hasAdultPhrase) return "PATIENT_START";
-
+  // 1) Nhận diện phiếu xét nghiệm trước. Cần đủ các từ khóa cốt lõi,
+  // không dựa vào dấu câu hoặc thứ tự trình bày.
   const hasLabTitle =
-    normalized.includes("PHIEU KET QUA XET NGHIEM") ||
-    (hasApproxWord("PHIEU") && hasApproxWord("KET") &&
-      hasApproxWord("QUA") && hasApproxWord("XET") && hasApproxWord("NGHIEM"));
-
+    hasAllWords(["KET", "QUA", "XET", "NGHIEM"]) ||
+    hasAllWords(["PHIEU", "XET", "NGHIEM"]);
   if (hasLabTitle) return "LAB_START";
+
+  // 2) Loại trừ tiêu đề phiếu cận lâm sàng độc lập.
+  const hasDiagnosticTitle =
+    (hasAllWords(["KET", "QUA"]) && hasAllWords(["SIEU", "AM"])) ||
+    (hasAllWords(["KET", "QUA"]) && hasAllWords(["X", "QUANG"])) ||
+    (hasAllWords(["KET", "QUA"]) && hasAllWords(["DIEN", "TIM"])) ||
+    (hasAllWords(["CHAN", "DOAN", "HINH", "ANH"]) && wordSet.has("PHIEU"));
+  if (hasDiagnosticTitle) return null;
+
+  // 3) Tiêu đề giấy khám sức khỏe. Sau chuẩn hóa, dấu câu và dấu tiếng Việt
+  // không còn ảnh hưởng. Chấp nhận 3/4 từ cốt lõi, nhưng bắt buộc có KHAM + KHOE.
+  const titleTokens = ["GIAY", "KHAM", "SUC", "KHOE"];
+  const titleScore = countWords(titleTokens);
+  const hasHealthTitle = titleScore >= 3 &&
+    wordSet.has("KHAM") && wordSet.has("KHOE");
+
+  // 4) KHÔNG bắt buộc OCR phải đọc được số 18. Thực tế số này thường bị
+  // nhận thành ký tự khác hoặc mất hẳn dù tiêu đề vẫn đọc rõ. Dùng các từ
+  // chỉ đối tượng người trưởng thành để xác nhận thay thế.
+  const adultTokens = ["NGUOI", "TU", "DU", "TUOI", "TRO", "LEN"];
+  const adultContextScore = countWords(adultTokens);
+  const hasAdultContext = adultContextScore >= 2 &&
+    ["NGUOI", "DU", "TUOI"].some(token => wordSet.has(token));
+
+  // Một số bản in chỉ OCR rõ cụm "định kỳ"; cho phép dùng làm ngữ cảnh
+  // bổ sung khi tiêu đề giấy khám sức khỏe đã khớp ít nhất 3/4 từ.
+  const hasPeriodicContext = wordSet.has("DINH") && wordSet.has("KY");
+
+  if (hasHealthTitle && (hasAdultContext || hasPeriodicContext)) {
+    return "PATIENT_START";
+  }
+
   return null;
 }
 
@@ -242,28 +242,34 @@ function detectSignatureAndRedStamp(
  *
  * Không sử dụng chữ ký hoặc dấu mộc đỏ làm điều kiện kết thúc.
  */
-function classifyPatientEnd(footerText: string, headerText: string): boolean {
-  const normalized = normalizeOcrText(`${footerText} ${headerText}`);
+function classifyPatientEnd(conclusionRegionText: string, headerText: string): boolean {
+  const normalized = normalizeOcrText(`${conclusionRegionText} ${headerText}`);
 
-  const hasOverallClassification =
-    normalized.includes("PHAN LOAI SUC KHOE") ||
-    normalized.includes("XEP LOAI SUC KHOE") ||
-    normalized.includes("PHAN LOAI SK");
+  const hasOverallClassification = [
+    "PHAN LOAI SUC KHOE",
+    "XEP LOAI SUC KHOE",
+    "PHAN LOAI SK",
+    "PHAN LOAI CHUNG"
+  ].some(phrase => normalized.includes(phrase));
 
-  const hasConclusion =
-    normalized.includes("KET LUAN") ||
-    normalized.includes("KET LUAN BENH");
+  // Tiêu đề có thể được in ở phần trên của trang, không nhất thiết nằm ở chân trang.
+  const hasConclusionHeading = [
+    "KET LUAN",
+    "KET LUAN CHUNG",
+    "KET LUAN SUC KHOE",
+    "KET QUA KHAM SUC KHOE"
+  ].some(phrase => normalized.includes(phrase));
 
-  const hasDoctorSign =
-    normalized.includes("BAC SI KHAM") ||
-    normalized.includes("NGUOI KHAM") ||
-    normalized.includes("CHU KY BAC SI") ||
-    normalized.includes("BAC SI");
+  const hasDoctorSign = [
+    "BAC SI KHAM",
+    "NGUOI KHAM",
+    "CHU KY BAC SI",
+    "BAC SI"
+  ].some(phrase => normalized.includes(phrase));
 
-  return (
-    (hasOverallClassification && (hasConclusion || hasDoctorSign)) ||
-    (hasConclusion && hasDoctorSign)
-  );
+  // Không lấy riêng chữ "Kết luận" làm điểm kết thúc vì một số biểu mẫu
+  // phụ cũng có tiêu đề này. Cần thêm phân loại sức khỏe hoặc thông tin bác sĩ.
+  return hasConclusionHeading && (hasOverallClassification || hasDoctorSign);
 }
 
 /**
@@ -332,7 +338,7 @@ function getPatientSegments(pages: ValidPage[]): PatientPageSegment[] {
 /**
  * Đọc PDF scan:
  * - OCR đầu trang để tìm PATIENT_START và LAB_START.
- * - Chỉ OCR chân trang hồ sơ cuối, quét ngược đến khi tìm thấy patientEnd.
+ * - Chỉ OCR vùng trên 40% của các trang hồ sơ cuối, quét ngược đến khi tìm thấy patientEnd.
  * - Các hồ sơ trước kết thúc tại PATIENT_START kế tiếp, không cần OCR footer.
  * - LAB_START đánh dấu phần phụ lục; toàn bộ trang từ đó đến hồ sơ kế tiếp bị loại.
  *
@@ -478,13 +484,15 @@ export async function extractAndFilterPages(
         const displayBase64 = displayCanvas.toDataURL("image/jpeg", 0.82);
         metrics.imageEncodeMs += Date.now() - displayEncodeStartedAt;
 
-        // OCR 34% đầu trang, chiều rộng tối đa 760px, PSM 6.
+        // OCR nhanh vùng đầu trang: chỉ lấy 28% phía trên và thu nhỏ về
+        // tối đa 820px chiều rộng. Không OCR toàn trang, không phóng lớn ảnh.
+        // Ảnh hiển thị (1.8) và ảnh gửi Gemini (1.35) giữ nguyên chất lượng.
         const headerSourceHeight = Math.max(
           1,
-          Math.floor(displayCanvas.height * 0.34)
+          Math.floor(displayCanvas.height * 0.28)
         );
 
-        const headerScale = Math.min(1, 760 / displayCanvas.width);
+        const headerScale = Math.min(1, 820 / displayCanvas.width);
 
         headerCanvas.width = Math.max(
           1,
@@ -530,8 +538,24 @@ export async function extractAndFilterPages(
 
         const documentMarker = classifyHeader(headerText);
 
-        // Ảnh AI: giữ scale 1.0 và JPEG 0.62.
-        const aiViewport = page.getViewport({ scale: 1.0 });
+        const normalizedHeaderForLog = normalizeOcrText(headerText);
+        const headerWordSetForLog = new Set(normalizedHeaderForLog.split(/\s+/).filter(Boolean));
+        console.info("[KSK Header Marker]", {
+          page: pageNumber,
+          marker: documentMarker || "NONE",
+          headerOcrChars: headerText.length,
+          normalizedTitleWords: ["GIAY", "KHAM", "SUC", "KHOE"].filter(word => headerWordSetForLog.has(word)),
+          has18Token: ["18", "I8", "L8", "IB", "1B"].some(word => headerWordSetForLog.has(word)),
+          adultContextWords: ["NGUOI", "TU", "DU", "TUOI", "TRO", "LEN"].filter(word => headerWordSetForLog.has(word)),
+          hasPeriodicContext: headerWordSetForLog.has("DINH") && headerWordSetForLog.has("KY"),
+          headerCrop: "top-28%, max-width-820px",
+          hasLabTitleWords: ["KET", "QUA", "XET", "NGHIEM"].every(word => headerWordSetForLog.has(word))
+        });
+
+        // Ảnh gửi Gemini: render trực tiếp từ PDF ở scale 1.35.
+        // Không thu nhỏ từ displayCanvas 1.8 xuống 1.0 vì sẽ làm mềm nét
+        // chữ viết tay, dấu tick và số phân loại nhỏ.
+        const aiViewport = page.getViewport({ scale: 1.35 });
 
         aiCanvas.width = Math.ceil(aiViewport.width);
         aiCanvas.height = Math.ceil(aiViewport.height);
@@ -539,20 +563,15 @@ export async function extractAndFilterPages(
         aiContext.fillStyle = "#ffffff";
         aiContext.fillRect(0, 0, aiCanvas.width, aiCanvas.height);
 
-        aiContext.drawImage(
-          displayCanvas,
-          0,
-          0,
-          displayCanvas.width,
-          displayCanvas.height,
-          0,
-          0,
-          aiCanvas.width,
-          aiCanvas.height
-        );
+        const aiRenderStartedAt = Date.now();
+        await page.render({
+          canvasContext: aiContext,
+          viewport: aiViewport
+        } as any).promise;
+        metrics.renderMs += Date.now() - aiRenderStartedAt;
 
         const aiEncodeStartedAt = Date.now();
-        const base64 = aiCanvas.toDataURL("image/jpeg", 0.62);
+        const base64 = aiCanvas.toDataURL("image/jpeg", 0.78);
         metrics.imageEncodeMs += Date.now() - aiEncodeStartedAt;
 
         return {
@@ -633,7 +652,7 @@ export async function extractAndFilterPages(
      *   kế tiếp, vì vậy không cần OCR footer các trang này.
      * - Chỉ hồ sơ cuối cùng không có PATIENT_START kế tiếp nên cần tìm patientEnd.
      * - Các hồ sơ trước kết thúc tại PATIENT_START kế tiếp; phần sau LAB_START bị loại.
-     * - Quét hồ sơ cuối từ cuối PDF trở ngược và dừng ngay khi tìm thấy patientEnd.
+     * - Quét hồ sơ cuối từ cuối PDF trở ngược; trên mỗi trang OCR vùng 40% tính từ mép trên.
      *
      * LAB_START là ranh giới giữa phiếu khám cần trích xuất và phần phụ lục.
      * Toàn bộ trang từ LAB_START đến trước PATIENT_START tiếp theo được loại.
@@ -671,7 +690,18 @@ export async function extractAndFilterPages(
     console.info("[KSK Segmentation]", {
       patientStartPages: validPages
         .filter(page => page.documentMarker === "PATIENT_START")
-        .map(page => page.pageNumber),
+        .map(page => ({
+          page: page.pageNumber,
+          headerText: (page.headerText || "").replace(/\s+/g, " ").trim().slice(0, 180)
+        })),
+      patientSegments: patientSegments.map((segment, index) => ({
+        segment: index,
+        startPage: validPages[segment.start]?.pageNumber,
+        endPage: validPages[segment.end]?.pageNumber,
+        labStartPage: segment.labStart === undefined
+          ? null
+          : validPages[segment.labStart]?.pageNumber
+      })),
       excludedAttachmentRanges
     });
 
@@ -703,11 +733,10 @@ export async function extractAndFilterPages(
         });
 
         if (!footerContext || !sourceContext) {
-          throw new Error("Trình duyệt không thể khởi tạo canvas OCR chân trang.");
+          throw new Error("Trình duyệt không thể khởi tạo canvas OCR vùng kết luận.");
         }
 
-        // Giữ nguyên chất lượng render footer hiện tại để không ảnh hưởng
-        // khả năng nhận diện chữ viết tay và thông tin kết luận.
+        // Render trang ở scale 1.8; chỉ crop vùng trên 40% để OCR tiêu đề kết luận.
         const viewport = page.getViewport({ scale: 1.8 });
 
         sourceCanvas.width = Math.ceil(viewport.width);
@@ -725,11 +754,11 @@ export async function extractAndFilterPages(
 
         metrics.renderMs += Date.now() - renderStartedAt;
 
-        // OCR vùng 35%-100% trang, chiều rộng tối đa 1000px.
-        const footerSourceY = Math.floor(sourceCanvas.height * 0.35);
+        // OCR vùng 0%-40% tính từ mép trên trang (nơi thường có tiêu đề kết luận), chiều rộng tối đa 1000px.
+        const footerSourceY = 0;
         const footerSourceHeight = Math.max(
           1,
-          sourceCanvas.height - footerSourceY
+          Math.floor(sourceCanvas.height * 0.40)
         );
 
         const footerScale = Math.min(1, 1000 / sourceCanvas.width);
@@ -761,7 +790,7 @@ export async function extractAndFilterPages(
 
         // Chỉ lưu tín hiệu hình ảnh để tham khảo/debug.
         // Không dùng chữ ký hoặc dấu đỏ làm điều kiện kết thúc hồ sơ.
-        const visualMarks = detectSignatureAndRedStamp(footerCanvas);
+        const visualMarks = detectSignatureAndRedStamp(sourceCanvas);
 
         validPage.hasSignature = visualMarks.hasSignature;
         validPage.hasRedStamp = visualMarks.hasRedStamp;
@@ -773,10 +802,10 @@ export async function extractAndFilterPages(
 
           metrics.footerOcrCalls++;
 
-          const footerText = footerResult?.data?.text || "";
+          const conclusionRegionText = footerResult?.data?.text || "";
           const headerText = validPage.headerText || "";
 
-          validPage.patientEnd = classifyPatientEnd(footerText, headerText);
+          validPage.patientEnd = classifyPatientEnd(conclusionRegionText, headerText);
 
           console.debug("[KSK Final Patient Detection]", {
             page: validPage.pageNumber,
@@ -787,7 +816,7 @@ export async function extractAndFilterPages(
           });
         } catch (ocrError) {
           console.warn(
-            `Không OCR được vùng cuối trang ${validPage.pageNumber}:`,
+            `Không OCR được vùng kết luận đầu trang ${validPage.pageNumber}:`,
             ocrError
           );
         } finally {
@@ -810,7 +839,7 @@ export async function extractAndFilterPages(
 
     if (footerTargetPages.length > 0) {
       console.info(
-        `[KSK Final Patient Detection] Bắt đầu quét ngược ${footerTargetPages.length} trang cuối hồ sơ.`
+        `[KSK Final Patient Detection] Bắt đầu quét ngược ${footerTargetPages.length} trang cuối hồ sơ (OCR vùng trên 40%).`
       );
 
       // Quét tuần tự từ trang cuối trở về đầu hồ sơ cuối.
@@ -833,7 +862,7 @@ export async function extractAndFilterPages(
       }
     }
 
-    console.info("[KSK Footer OCR Summary]", {
+    console.info("[KSK Conclusion OCR Summary]", {
       finalPatientPages: footerTargetPages.length,
       footerPagesActuallyProcessed: footerProcessed,
       finalPatientEndFound,
@@ -843,7 +872,7 @@ export async function extractAndFilterPages(
     /*
      * Kết quả phân đoạn:
      * - Hồ sơ trung gian: kết thúc ngay trước PATIENT_START kế tiếp.
-     * - Hồ sơ cuối: page.tsx sử dụng patientEnd để xác định điểm kết thúc.
+     * - Hồ sơ cuối: page.tsx sử dụng patientEnd, được nhận diện bằng OCR vùng trên 40% trang.
      * - Chỉ hồ sơ cuối mới cần OCR footer; không OCR footer toàn bộ PDF.
      */
 

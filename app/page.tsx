@@ -270,7 +270,11 @@ export default function OCRPage() {
     setGlobalImageIndex(0);
 
     try {
-      const BATCH_SIZE = 15;
+      // Giới hạn Gemini hiện tại: tối đa 15 trang khám cho mỗi hồ sơ.
+      // Không tăng giới hạn để che lỗi phân đoạn; trang xét nghiệm đã được
+      // loại ở pdfProcessor trước khi đếm số trang gửi AI.
+      const MAX_AI_PAGES_PER_PATIENT = 15;
+      const BATCH_SIZE = MAX_AI_PAGES_PER_PATIENT;
       const allM1Patients: any[] = [];
       const allM2Patients: any[] = [];
       let adultRanges: Array<{ id: number; start: number; end: number }> = [];
@@ -285,8 +289,22 @@ if (docType === "ADULT_18") {
     .filter(index => index >= 0);
 
   if (starts.length === 0) {
+    // Không in nguyên văn OCR đầu trang vì có thể chứa họ tên và dữ liệu cá nhân.
+    // Chi tiết nhận diện từng trang được ghi an toàn tại [KSK Header Marker].
+    console.error(
+      "[KSK Header OCR Debug] Không tìm thấy PATIENT_START.",
+      allPdfPages
+        .filter(page => String(page.headerText || "").trim())
+        .slice(0, 12)
+        .map(page => ({
+          page: page.pageNumber,
+          hasHeaderText: true,
+          headerOcrChars: String(page.headerText || "").length,
+          marker: page.documentMarker || "NONE"
+        }))
+    );
     throw new Error(
-      "OCR chưa nhận diện được tiêu đề giấy khám sức khỏe người từ đủ 18 tuổi. Vui lòng kiểm tra vùng đầu trang hoặc tải lại PDF."
+      "OCR đã xử lý vùng đầu trang nhưng chưa gắn được PATIENT_START. Hãy kiểm tra các dòng [KSK Header Marker] để xem trang nào đang bị phân loại NONE hoặc LAB_START."
     );
   }
 
@@ -402,9 +420,17 @@ if (docType === "ADULT_18") {
       );
     }
 
-    if (aiPages.length > BATCH_SIZE) {
+    console.info("[KSK AI Page Count]", {
+      patientStartPage: allPdfPages[range.start].pageNumber,
+      segmentPageCount: range.end - range.start + 1,
+      excludedLabPages: range.end - range.start + 1 - aiPages.length,
+      aiPageCount: aiPages.length,
+      maxAllowed: MAX_AI_PAGES_PER_PATIENT
+    });
+
+    if (aiPages.length > MAX_AI_PAGES_PER_PATIENT) {
       throw new Error(
-        `Hồ sơ bắt đầu ở trang PDF ${allPdfPages[range.start].pageNumber} có ${aiPages.length} trang khám cần gửi AI, vượt giới hạn ${BATCH_SIZE} trang. Chưa gửi AI để tránh mất ngữ cảnh.`
+        `Hồ sơ bắt đầu ở trang PDF ${allPdfPages[range.start].pageNumber} có ${aiPages.length} trang khám cần gửi AI sau khi loại ${range.end - range.start + 1 - aiPages.length} trang xét nghiệm, vượt giới hạn ${MAX_AI_PAGES_PER_PATIENT} trang. Hãy kiểm tra [KSK Segmentation] và [KSK AI Page Count]; hệ thống không tự cắt hồ sơ để tránh mất ngữ cảnh.`
       );
     }
   }
@@ -999,7 +1025,16 @@ if (worksheet.pageSetup) {
               return (
                 <div
                   key={p._id}
-                  onClick={() => setPatientIndex(idx)}
+                  onClick={() => {
+                    setPatientIndex(idx);
+                    const firstPatientPage = p.patientImages?.[0];
+                    if (firstPatientPage) {
+                      const firstImageIndex = allPdfPages.findIndex(
+                        page => page.pageNumber === firstPatientPage.pageNumber
+                      );
+                      if (firstImageIndex >= 0) changeGlobalPage(firstImageIndex);
+                    }
+                  }}
                   style={{
                     padding: "12px 10px", cursor: "pointer", borderBottom: "1px solid #f3f4f6",
                     background: patientIndex === idx ? "#eff6ff" : "transparent",
@@ -1056,7 +1091,7 @@ if (worksheet.pageSetup) {
                 >
                   <ArrowLeft size={16} />
                 </button>
-                <strong style={{ margin: "0 15px" }}>Trang {globalImageIndex + 1} / {allPdfPages.length}</strong>
+                <strong style={{ margin: "0 15px" }}>Trang {allPdfPages[globalImageIndex]?.pageNumber ?? globalImageIndex + 1} (ảnh {globalImageIndex + 1}/{allPdfPages.length})</strong>
                 <button 
                   onClick={() => changeGlobalPage(Math.min(allPdfPages.length - 1, globalImageIndex + 1))}
                   disabled={globalImageIndex === allPdfPages.length - 1}
@@ -1099,8 +1134,11 @@ if (worksheet.pageSetup) {
                      transform: `translate(${position.x}px, ${position.y}px) scale(${zoom})`,
                      transformOrigin: "center center",
                      transition: isDragging ? "none" : "transform 0.1s ease-out",
-                     maxWidth: "100%", 
+                     width: "auto",
+                     maxWidth: "100%",
+                     maxHeight: "100%",
                      height: "auto",
+                     objectFit: "contain",
                      left: 0, right: 0, top: 0, bottom: 0, margin: "auto",
                      pointerEvents: "none"
                    }} 
